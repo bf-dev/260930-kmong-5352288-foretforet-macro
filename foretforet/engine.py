@@ -244,7 +244,9 @@ class Engine:
                 await page.wait_for_load_state("domcontentloaded")
                 await self._fill_kakao(page, uid)
             else:
-                await page.evaluate("sns_login_log('naver')")
+                # go straight to the OAuth entry: with stale SNS cookies member.html
+                # renders the SNS join form (no passwd field) and sns_login_log() throws
+                await page.goto(BASE + "/list/API/login_naver.html", wait_until="domcontentloaded")
                 await page.wait_for_url(re.compile(r"nid\.naver\.com|foretforet\.com(?!/shop/member)"),
                                         timeout=20000)
                 await self._fill_naver(page, uid)
@@ -270,11 +272,22 @@ class Engine:
             await asyncio.sleep(0.4)
             await self._type_into(page, "#pw", self.pw)
             await asyncio.sleep(0.4)
-            btn = page.locator("#log\\.login, button[type=submit]").first
-            await btn.click()
+            await self._click_naver_login(page)
             self.log("네이버 아이디/비밀번호 입력 완료. 추가 인증이 뜨면 창에서 직접 진행해 주세요.")
         else:
             self.log("네이버 로그인 창이 열렸습니다. 창에서 직접 로그인해 주세요.")
+
+    async def _click_naver_login(self, page) -> None:
+        # Naver's 2026 login page has #loginBtn_row / #loginBtn_column (one of them
+        # visible depending on width); the old page had #log.login. A plain
+        # button[type=submit] hits a hidden language-switch button first.
+        for sel in ("#loginBtn_row", "#loginBtn_column", "#log\\.login", "button.btn_login"):
+            loc = page.locator(sel)
+            for i in range(await loc.count()):
+                if await loc.nth(i).is_visible():
+                    await loc.nth(i).click()
+                    return
+        await page.locator("#pw").press("Enter")
 
     async def _fill_kakao(self, page, uid: str) -> None:
         if "kakao.com" not in page.url:
