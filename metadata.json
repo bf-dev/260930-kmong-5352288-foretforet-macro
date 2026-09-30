@@ -1,0 +1,20 @@
+{
+  "project": "260930-kmong-5352288-foretforet-macro",
+  "customerId": "f799eaed-99e4-4036-b304-ed38c3166a86",
+  "partnerId": 5352288,
+  "customerName": "배고픈숲3094",
+  "kmongOrderIds": [7643217],
+  "status": "active",
+  "createdAt": "2026-09-30",
+  "deploy": {
+    "kind": "windows-app (onedir zip)",
+    "repo": "bf-dev/260930-kmong-5352288-foretforet-macro",
+    "build": "GitHub Actions windows-latest (.github/workflows/build.yml)",
+    "artifactsCustomerKey": "5352288",
+    "artifactSource": "foretforet-macro-run",
+    "publish": "~/workspace/scripts/works-publish 5352288 out/foretforet-macro-<ver>.zip",
+    "manifest": "https://static.neoworks.us/5352288/version-foretforet.json",
+    "version": "1.0.0"
+  },
+  "notes": "foretforet.com (MakeShop) open-drop purchase macro. Open 2026-10-01 10:00 KST. Adds rows (url/size/qty, enable checkbox) to cart at the exact second, goes to order.html and stops for the customer to pay. See NOTES.md."
+}

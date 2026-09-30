@@ -1,0 +1,9 @@
+.venv/
+dist/
+build/
+out/
+__pycache__/
+.pytest_cache/
+screenshots/
+*.spec
+evidence/

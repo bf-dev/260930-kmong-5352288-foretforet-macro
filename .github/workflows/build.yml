@@ -1,0 +1,113 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: unit tests
+        run: python -m pytest tests/ -q
+
+      # --onedir, never --onefile: onefile self-extracts to %TEMP% on every run and
+      # Defender has quarantined that pattern on a customer PC before.
+      # Playwright's driver (node) is bundled by --collect-all; the browser is the
+      # customer's installed Edge/Chrome (channel=msedge/chrome), so none is shipped.
+      - name: build (onedir)
+        run: >
+          pyinstaller --onedir --noconsole
+          --name foretforet-macro
+          --version-file ci/version_info.txt
+          --icon ci/app.ico
+          --collect-all playwright
+          --hidden-import tkinter
+          --noconfirm
+          main.py
+
+      - name: exe exists and is a real PE
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist\foretforet-macro\foretforet-macro.exe
+          "{0}  {1:N1} MB" -f $exe.Name, ($exe.Length / 1MB)
+          $fs = [System.IO.File]::OpenRead($exe.FullName)
+          $b = New-Object byte[] 2; $fs.Read($b, 0, 2) | Out-Null; $fs.Close()
+          if ($b[0] -ne 0x4D -or $b[1] -ne 0x5A) { throw "not a PE binary" }
+          $vi = (Get-Item $exe.FullName).VersionInfo
+          "version resource: $($vi.ProductName) / $($vi.FileVersion)"
+          if (-not $vi.FileVersion) { throw "version resource missing" }
+          if (-not (Test-Path dist\foretforet-macro\_internal)) { throw "_internal missing" }
+          $drv = Get-ChildItem dist\foretforet-macro\_internal -Recurse -Filter node.exe | Select-Object -First 1
+          if (-not $drv) { throw "playwright driver (node.exe) not bundled" }
+          "playwright driver: $($drv.FullName)"
+
+      - name: package zip
+        run: python ci/package_zip.py dist/foretforet-macro out
+
+      - name: update Defender signatures
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -SignatureUpdate
+          "signature update exit: $LASTEXITCODE"
+
+      - name: Defender scan of the onedir build
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File ci\defender_scan.ps1 -Path dist\foretforet-macro -Label "onedir" -MustBeClean
+
+      - name: Defender scan of the delivered zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem out\*.zip | Select-Object -First 1
+          powershell -ExecutionPolicy Bypass -File ci\defender_scan.ps1 -Path $zip.FullName -Label "zip" -MustBeClean
+
+      # Frozen exe: imports, live option parse of the 6 default rows, clock sync,
+      # blocking Artifacts API upload. Run from the extracted zip, the way the
+      # customer runs it.
+      - name: selftest of the exe extracted from the delivered zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem out\*.zip | Select-Object -First 1
+          Expand-Archive -Path $zip.FullName -DestinationPath unzipped -Force
+          $exe = Get-ChildItem unzipped -Recurse -Filter foretforet-macro.exe | Select-Object -First 1
+          "extracted exe: $($exe.FullName)"
+          $p = Start-Process $exe.FullName -ArgumentList "--selftest" -RedirectStandardOutput selftest.log -PassThru -Wait
+          if (Test-Path selftest.log) { Get-Content selftest.log }
+          "selftest exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "selftest failed" }
+
+      # The window the customer sees: row 2 unchecked and row 5 qty 0 (skipped
+      # but kept), qty column, delete buttons, options loaded from the live page.
+      - name: GUI screenshot
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File ci\gui_screenshot.ps1 -DemoArgs "--guidemo,--hold=150000" -Out gui.png -SettleSeconds 45
+
+      - name: sha256 of the delivered zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem out\*.zip | Select-Object -First 1
+          $h = Get-FileHash $zip.FullName -Algorithm SHA256
+          "{0}  {1}  {2} bytes" -f $h.Hash.ToLower(), $zip.Name, $zip.Length
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: foretforet-macro
+          path: |
+            out/*.zip
+            screenshots/*.png
+            selftest.log
+          retention-days: 14

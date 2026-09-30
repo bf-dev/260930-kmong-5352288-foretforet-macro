@@ -1,0 +1,32 @@
+# PyInstaller 윈도우 버전 리소스 (Kmong customer 5352288 / order 7643217).
+#
+# 메타데이터가 하나도 없는 exe 는 그 자체로 디펜더의 평판 점수를 깎는다.
+# 서명서를 살 수는 없지만, 최소한 "누가 만든 무엇인지" 는 파일 속성에 박아둔다.
+# 버전을 올릴 때 config.APP_VERSION 과 아래 숫자를 같이 올린다.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '041204b0',
+        [StringStruct('CompanyName', 'Neoworks'),
+         StringStruct('FileDescription', '포레포레 오픈 구매 매크로'),
+         StringStruct('FileVersion', '1.0.0.0'),
+         StringStruct('InternalName', 'foretforet-macro'),
+         StringStruct('LegalCopyright', 'Copyright (c) 2026 Neoworks'),
+         StringStruct('OriginalFilename', 'foretforet-macro.exe'),
+         StringStruct('ProductName', '포레포레 구매 매크로'),
+         StringStruct('ProductVersion', '1.0.0.0')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1042, 1200])])
+  ]
+)

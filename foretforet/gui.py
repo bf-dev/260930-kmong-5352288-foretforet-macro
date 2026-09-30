@@ -1,0 +1,465 @@
+# -*- coding: utf-8 -*-
+"""Tkinter window for the foretforet purchase macro (Kmong customer 5352288, order 7643217).
+
+Every product row has: use checkbox, product URL, option (size) dropdown filled
+from the live page, quantity, and a delete button. An unchecked row or quantity
+0 is skipped at the drop but keeps its URL and option. Everything except the
+password is saved between runs.
+"""
+from __future__ import annotations
+
+import queue
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+from tkinter import messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
+from . import config, parser
+from .clock import Clock
+from .engine import KST, Engine, parse_open_at
+from .reporter import Diagnostics
+
+FONT = ("Malgun Gothic", 10)
+FONT_B = ("Malgun Gothic", 10, "bold")
+FONT_T = ("Malgun Gothic", 14, "bold")
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/140.0 Safari/537.36"}
+
+
+def fetch_options(url: str) -> tuple[str, list[parser.Option], bool]:
+    """(title, options, is_open) for a product URL. Raises on network errors."""
+    import requests
+    bu = parser.branduid_of(url)
+    if not bu:
+        raise ValueError("branduid 가 없는 주소입니다")
+    r = requests.get(parser.product_url(bu), headers=UA, timeout=12)
+    r.encoding = r.apparent_encoding or "euc-kr"
+    html = r.text
+    return parser.parse_title(html), parser.parse_options(html), parser.is_open(html)
+
+
+class Row:
+    def __init__(self, app: "App", data: dict) -> None:
+        self.app = app
+        f = app.rows_frame
+        self.enabled = tk.BooleanVar(value=bool(data.get("enabled", True)))
+        self.url = tk.StringVar(value=data.get("url", ""))
+        self.option = tk.StringVar(value=data.get("option", ""))
+        self.qty = tk.StringVar(value=str(data.get("qty", 1)))
+        self.info = tk.StringVar(value="")
+        self.w_no = ttk.Label(f, text="", width=3, anchor="center")
+        self.w_chk = ttk.Checkbutton(f, variable=self.enabled, command=self.refresh_style)
+        self.w_url = ttk.Entry(f, textvariable=self.url, width=52)
+        self.w_opt = ttk.Combobox(f, textvariable=self.option, width=14)
+        self.w_load = ttk.Button(f, text="옵션", width=5, command=self.load_options)
+        self.w_qty = ttk.Spinbox(f, from_=0, to=99, textvariable=self.qty, width=4,
+                                 command=self.refresh_style)
+        self.w_info = ttk.Label(f, textvariable=self.info, width=24, foreground="#555")
+        self.w_del = ttk.Button(f, text="삭제", width=5, command=lambda: app.delete_row(self))
+        for v in (self.enabled, self.url, self.option, self.qty):
+            v.trace_add("write", lambda *_: app.schedule_save())
+        self.qty.trace_add("write", lambda *_: self.refresh_style())
+        self.options: list[parser.Option] = []
+
+    def widgets(self):
+        return (self.w_no, self.w_chk, self.w_url, self.w_opt, self.w_load, self.w_qty,
+                self.w_info, self.w_del)
+
+    def grid(self, r: int) -> None:
+        self.w_no.configure(text=str(r))
+        for c, w in enumerate(self.widgets()):
+            w.grid(row=r, column=c, padx=2, pady=2, sticky="we" if c == 2 else "w")
+        self.refresh_style()
+
+    def destroy(self) -> None:
+        for w in self.widgets():
+            w.destroy()
+
+    def data(self) -> dict:
+        return config.normalize_rows([{"url": self.url.get(), "option": self.option.get(),
+                                       "qty": self.qty.get(), "enabled": self.enabled.get()}])[0]
+
+    def active(self) -> bool:
+        d = self.data()
+        return d["enabled"] and d["qty"] > 0 and bool(d["url"])
+
+    def refresh_style(self) -> None:
+        try:
+            skip = not self.active()
+            self.w_no.configure(foreground="#aaa" if skip else "#000",
+                                text=self.w_no.cget("text"))
+            if skip and not self.info.get().startswith("건너뜀"):
+                self._saved_info = self.info.get()
+                self.info.set("건너뜀 (체크 해제/수량 0)")
+            elif not skip and self.info.get().startswith("건너뜀"):
+                self.info.set(getattr(self, "_saved_info", ""))
+        except Exception:
+            pass
+
+    def load_options(self, quiet: bool = False) -> None:
+        url = self.url.get().strip()
+        if not url:
+            return
+        self.info.set("불러오는 중...")
+
+        def work():
+            try:
+                title, opts, is_open = fetch_options(url)
+                self.app.ui(lambda: self._apply(title, opts, is_open))
+            except Exception as exc:
+                self.app.ui(lambda: self.info.set(f"불러오기 실패: {type(exc).__name__}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply(self, title: str, opts: list[parser.Option], is_open: bool) -> None:
+        self.options = opts
+        self.w_opt.configure(values=[o.text for o in opts])
+        cur = self.option.get().strip()
+        opt, note = parser.match_option(cur, opts) if cur else (None, "옵션 선택 필요")
+        if opt and opt.text != cur:
+            self.option.set(opt.text)
+        state = "판매중" if is_open else "오픈 전"
+        if opt:
+            stock = "무제한" if opt.unlimited else (opt.stock if opt.stock is not None else "?")
+            txt = f"재고 {stock} · {state}"
+        else:
+            txt = f"{note[:14]} · {state}"
+        self._saved_info = txt
+        self.info.set(txt)
+        self.refresh_style()
+        self.app.log(f"{self.w_no.cget('text')}번 {title[:28]}: 옵션 {len(opts)}개, "
+                     f"선택 {opt.text if opt else '-'} ({txt})")
+
+
+class App:
+    def __init__(self, root: tk.Tk, diag: Diagnostics, demo: bool = False) -> None:
+        self.root = root
+        self.diag = diag
+        self.demo = demo
+        self.q: queue.Queue = queue.Queue()
+        self.engine: Engine | None = None
+        self.rows: list[Row] = []
+        self._save_after = None
+        self.clock = Clock()
+        self.s = config.default_settings() if demo else config.load_settings()
+
+        root.title(f"{config.APP_TITLE} v{config.APP_VERSION}")
+        root.geometry("1060x800")
+        root.minsize(940, 640)
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except Exception:
+            pass
+        for k in ("TLabel", "TButton", "TCheckbutton", "TRadiobutton", "TEntry", "TCombobox"):
+            style.configure(k, font=FONT)
+        style.configure("Title.TLabel", font=FONT_T)
+        style.configure("Head.TLabel", font=FONT_B)
+        style.configure("Big.TButton", font=FONT_B, padding=(14, 6))
+        root.option_add("*TCombobox*Listbox.font", FONT)
+
+        outer = ttk.Frame(root, padding=10)
+        outer.pack(fill="both", expand=True)
+        top = ttk.Frame(outer)
+        top.pack(fill="x")
+        ttk.Label(top, text=config.APP_TITLE, style="Title.TLabel").pack(side="left")
+        self.update_var = tk.StringVar(value=f"v{config.APP_VERSION}")
+        ttk.Label(top, textvariable=self.update_var, foreground="#666").pack(side="right")
+
+        # 1. products
+        box = ttk.LabelFrame(outer, text=" 1. 구매할 상품 (체크 해제 또는 수량 0 = 건너뜀, 주소/옵션은 그대로 보관) ",
+                             padding=6)
+        box.pack(fill="x", pady=(8, 4))
+        self.rows_frame = ttk.Frame(box)
+        self.rows_frame.pack(fill="x")
+        self.rows_frame.columnconfigure(2, weight=1)
+        for c, t in enumerate(("번호", "사용", "상품 주소 (URL)", "옵션(사이즈)", "", "수량", "재고/상태", "")):
+            ttk.Label(self.rows_frame, text=t, style="Head.TLabel").grid(row=0, column=c, padx=2, sticky="w")
+        btns = ttk.Frame(box)
+        btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(btns, text="+ 상품 추가", command=self.add_row).pack(side="left")
+        ttk.Button(btns, text="옵션 전체 불러오기", command=self.load_all).pack(side="left", padx=6)
+        self.active_var = tk.StringVar()
+        ttk.Label(btns, textvariable=self.active_var, foreground="#0a5").pack(side="right")
+
+        mid = ttk.Frame(outer)
+        mid.pack(fill="x", pady=4)
+        mid.columnconfigure(0, weight=1)
+        mid.columnconfigure(1, weight=1)
+
+        # 2. open time
+        tb = ttk.LabelFrame(mid, text=" 2. 오픈 시각 (한국시간) ", padding=6)
+        tb.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.open_at = tk.StringVar(value=self.s.get("open_at") or config.DEFAULT_OPEN_AT)
+        self.open_at.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Entry(tb, textvariable=self.open_at, width=22).grid(row=0, column=0, sticky="w")
+        ttk.Label(tb, text="예: 2026-10-01 10:00:00").grid(row=0, column=1, padx=6, sticky="w")
+        self.server_var = tk.StringVar(value="사이트 서버 시각: 확인 중")
+        ttk.Label(tb, textvariable=self.server_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.left_var = tk.StringVar(value="")
+        ttk.Label(tb, textvariable=self.left_var, foreground="#c40").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Label(tb, text="3분 전에 로그인·상품 페이지를 미리 열고, 정각에 담습니다.",
+                  foreground="#666").grid(row=3, column=0, columnspan=2, sticky="w")
+
+        # 3. login
+        lb = ttk.LabelFrame(mid, text=" 3. 로그인 ", padding=6)
+        lb.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self.login_type = tk.StringVar(value=self.s.get("login_type") or config.DEFAULT_LOGIN_TYPE)
+        self.login_type.trace_add("write", lambda *_: self.schedule_save())
+        rf = ttk.Frame(lb)
+        rf.grid(row=0, column=0, columnspan=3, sticky="w")
+        for t in config.LOGIN_TYPES:
+            ttk.Radiobutton(rf, text=t if t != "자체" else "포레포레 아이디", value=t,
+                            variable=self.login_type).pack(side="left", padx=(0, 8))
+        ttk.Label(lb, text="아이디").grid(row=1, column=0, sticky="w", pady=2)
+        self.login_id = tk.StringVar(value=self.s.get("login_id") or "")
+        self.login_id.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Entry(lb, textvariable=self.login_id, width=24).grid(row=1, column=1, sticky="w")
+        ttk.Label(lb, text="비밀번호").grid(row=2, column=0, sticky="w", pady=2)
+        self.login_pw = tk.StringVar(value="")
+        ttk.Entry(lb, textvariable=self.login_pw, width=24, show="*").grid(row=2, column=1, sticky="w")
+        self.remember_id = tk.BooleanVar(value=bool(self.s.get("remember_id", True)))
+        self.remember_id.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Checkbutton(lb, text="아이디 저장", variable=self.remember_id).grid(row=1, column=2, padx=6, sticky="w")
+        self.btn_login = ttk.Button(lb, text="로그인 테스트", command=self.login_test)
+        self.btn_login.grid(row=2, column=2, padx=6, sticky="w")
+        ttk.Label(lb, text="비밀번호는 저장하지 않습니다. 추가 인증은 뜬 창에서 직접 진행하세요.",
+                  foreground="#666").grid(row=3, column=0, columnspan=3, sticky="w")
+
+        # 4. payment
+        pb = ttk.LabelFrame(outer, text=" 4. 결제 ", padding=6)
+        pb.pack(fill="x", pady=4)
+        self.auto_bank = tk.BooleanVar(value=bool(self.s.get("auto_bank", False)))
+        self.auto_bank.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Checkbutton(pb, text="무통장입금으로 주문까지 자동 완료 (끄면 주문서에서 멈추고 직접 결제)",
+                        variable=self.auto_bank).pack(side="left")
+        ttk.Label(pb, text="   입금자명").pack(side="left")
+        self.depositor = tk.StringVar(value=self.s.get("depositor") or "")
+        self.depositor.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Entry(pb, textvariable=self.depositor, width=12).pack(side="left", padx=4)
+
+        # 5. controls + log
+        cb = ttk.Frame(outer)
+        cb.pack(fill="x", pady=(6, 4))
+        self.btn_start = ttk.Button(cb, text="시작 (오픈 대기)", style="Big.TButton", command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(cb, text="중지", style="Big.TButton", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        self.status_var = tk.StringVar(value="대기 중")
+        ttk.Label(cb, textvariable=self.status_var, style="Head.TLabel").pack(side="left", padx=10)
+        self.logbox = ScrolledText(outer, height=12, font=("Consolas", 9), state="disabled")
+        self.logbox.pack(fill="both", expand=True)
+
+        for d in self.s.get("rows") or []:
+            self.add_row(d, save=False)
+        self.update_active()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.after(100, self._pump)
+        root.after(500, self._tick)
+        threading.Thread(target=self._sync_clock, daemon=True).start()
+        self.log(f"프로그램 시작 v{config.APP_VERSION} (고객 {config.CUSTOMER_ID})")
+
+    # -------------------------------------------------------------- plumbing
+    def ui(self, fn) -> None:
+        self.q.put(fn)
+
+    def log(self, msg: str) -> None:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        try:
+            self.diag.log(msg)
+        except Exception:
+            pass
+        self.q.put(("log", line))
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if callable(item):
+                    try:
+                        item()
+                    except Exception:
+                        pass
+                elif item[0] == "log":
+                    self.logbox.configure(state="normal")
+                    self.logbox.insert("end", item[1] + "\n")
+                    lines = int(self.logbox.index("end-1c").split(".")[0])
+                    if lines > 3000:
+                        self.logbox.delete("1.0", "1000.0")
+                    self.logbox.see("end")
+                    self.logbox.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._pump)
+
+    def _sync_clock(self) -> None:
+        self.clock.sync(lambda m: self.log(m))
+
+    def _tick(self) -> None:
+        try:
+            now = self.clock.now()
+            self.server_var.set("사이트 서버 시각: " + datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d %H:%M:%S")
+                                + f"  (내 PC와 차이 {self.clock.offset_ms:+.0f}ms)")
+            try:
+                left = parse_open_at(self.open_at.get()) - now
+                if left > 0:
+                    h, m, s = int(left // 3600), int(left % 3600 // 60), int(left % 60)
+                    self.left_var.set(f"오픈까지 {h}시간 {m}분 {s}초")
+                else:
+                    self.left_var.set("오픈 시각이 지났습니다 (시작하면 바로 담기)")
+            except ValueError:
+                self.left_var.set("시각 형식 오류: 2026-10-01 10:00:00")
+        except Exception:
+            pass
+        self.root.after(500, self._tick)
+
+    # ------------------------------------------------------------------ rows
+    def add_row(self, data: dict | None = None, save: bool = True) -> None:
+        row = Row(self, data or {"url": "", "option": "", "qty": 1, "enabled": True})
+        self.rows.append(row)
+        row.grid(len(self.rows))
+        self.update_active()
+        if save:
+            self.schedule_save()
+
+    def delete_row(self, row: Row) -> None:
+        d = row.data()
+        if d["url"] and not self.demo:
+            if not messagebox.askyesno("삭제", f"{self.rows.index(row) + 1}번 줄을 지울까요?\n"
+                                             "(잠깐 빼기만 하려면 '사용' 체크를 끄세요)"):
+                return
+        row.destroy()
+        self.rows.remove(row)
+        for i, r in enumerate(self.rows, start=1):
+            r.grid(i)
+        self.schedule_save()
+
+    def load_all(self) -> None:
+        for r in self.rows:
+            r.load_options()
+
+    def update_active(self) -> None:
+        n = sum(1 for r in self.rows if r.active())
+        self.active_var.set(f"구매 대상 {n}줄 / 전체 {len(self.rows)}줄")
+
+    # -------------------------------------------------------------- settings
+    def collect(self) -> dict:
+        return {
+            "rows": [r.data() for r in self.rows],
+            "open_at": self.open_at.get().strip(),
+            "login_type": self.login_type.get(),
+            "login_id": self.login_id.get().strip(),
+            "auto_bank": bool(self.auto_bank.get()),
+            "depositor": self.depositor.get().strip(),
+            "remember_id": bool(self.remember_id.get()),
+        }
+
+    def schedule_save(self) -> None:
+        self.update_active()
+        if self._save_after:
+            try:
+                self.root.after_cancel(self._save_after)
+            except Exception:
+                pass
+        self._save_after = self.root.after(400, self.save)
+
+    def save(self) -> None:
+        self._save_after = None
+        if not self.demo:
+            config.save_settings(self.collect())
+
+    # ------------------------------------------------------------------ runs
+    def _busy(self, busy: bool, status: str) -> None:
+        self.btn_start.configure(state="disabled" if busy else "normal")
+        self.btn_login.configure(state="disabled" if busy else "normal")
+        self.btn_stop.configure(state="normal" if busy else "disabled")
+        self.status_var.set(status)
+
+    def _make_engine(self) -> Engine:
+        self.save()
+        run_diag = Diagnostics()
+        self.run_diag = run_diag
+        return Engine(self.collect(), self.login_pw.get(), run_diag,
+                      log=lambda m: self.q.put(("log", f"[{datetime.now().strftime('%H:%M:%S')}] {m}")),
+                      on_done=lambda mode, res: self.ui(lambda: self._done(mode, res)))
+
+    def login_test(self) -> None:
+        if self.engine:
+            return
+        self._busy(True, "로그인 테스트 중")
+        self.engine = self._make_engine()
+        self.engine.run_in_thread("login")
+
+    def start(self) -> None:
+        if self.engine:
+            return
+        try:
+            open_ts = parse_open_at(self.open_at.get())
+        except ValueError as exc:
+            messagebox.showerror("오픈 시각", str(exc))
+            return
+        if not any(r.active() for r in self.rows):
+            messagebox.showwarning("상품", "체크되어 있고 수량이 1 이상인 상품이 없습니다.")
+            return
+        if self.auto_bank.get() and not self.depositor.get().strip():
+            messagebox.showwarning("무통장입금", "입금자명을 입력해 주세요.")
+            return
+        when = datetime.fromtimestamp(open_ts, KST).strftime("%m월 %d일 %H:%M:%S")
+        self._busy(True, f"{when} 오픈 대기 중")
+        self.engine = self._make_engine()
+        self.engine.run_in_thread("buy")
+
+    def stop(self) -> None:
+        if self.engine:
+            self.engine.stop()
+            self.status_var.set("중지하는 중...")
+
+    def _done(self, mode: str, res: dict) -> None:
+        eng, self.engine = self.engine, None
+        result = res.get("result", "?")
+        labels = {"login-ok": "로그인 성공", "login-failed": "로그인 실패", "order-page": "주문서 도착",
+                  "basket-only": "장바구니까지 완료", "nothing-added": "담기 실패", "stopped": "중지됨",
+                  "no-rows": "상품 없음", "error": "오류"}
+        self._busy(False, labels.get(result, result))
+        self.log(f"결과: {labels.get(result, result)}")
+        try:
+            meta = {"mode": "login-test" if mode == "login" else "purchase", "result": result,
+                    "openAt": self.open_at.get(), "loginType": self.login_type.get(),
+                    "rows": [r.data() for r in self.rows],
+                    "serverOffsetMs": round(eng.clock.offset_ms if eng else 0)}
+            self.run_diag.add_json("result.json", res)
+            self.run_diag.upload(f"{meta['mode']}: {result}", meta)
+        except Exception:
+            pass
+
+    def on_close(self) -> None:
+        if self.engine:
+            if not messagebox.askyesno("종료", "실행 중입니다. 그래도 종료할까요?"):
+                return
+            self.engine.stop()
+        self.save()
+        self.root.destroy()
+
+
+def run_gui(diag: Diagnostics) -> None:
+    root = tk.Tk()
+    app = App(root, diag)
+    try:
+        from .updater import UpdaterThread
+        UpdaterThread(lambda m: app.ui(lambda: app.update_var.set(m))).start()
+    except Exception:
+        pass
+    root.mainloop()
+
+
+def run_demo(hold_ms: int, diag: Diagnostics) -> None:
+    """CI screenshot: default rows, row 2 unchecked, row 5 quantity 0, real option lookup."""
+    root = tk.Tk()
+    app = App(root, diag, demo=True)
+    app.rows[1].enabled.set(False)
+    app.rows[4].qty.set("0")
+    app.log("데모: 2번 줄 체크 해제, 5번 줄 수량 0 (둘 다 건너뜀, 주소/옵션은 보관)")
+    root.after(800, app.load_all)
+    root.after(hold_ms, root.destroy)
+    root.mainloop()
