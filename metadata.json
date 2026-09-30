@@ -16,10 +16,10 @@
     "artifactSource": "foretforet-macro-run",
     "publish": "~/workspace/scripts/works-publish 5352288 out/foretforet-macro-<ver>.zip",
     "manifest": "https://static.neoworks.us/5352288/version-foretforet.json",
-    "version": "1.0.0",
-    "package": "https://static.neoworks.us/5352288/foretforet-macro-1.0.0.zip",
-    "sha256": "7b3b4e4ba32faefe54ae22b5c38eb4622e2f38cbd1d4e78956c51dae363085e7",
-    "ciRun": 36664786660,
+    "version": "1.0.1",
+    "package": "https://static.neoworks.us/5352288/foretforet-macro-1.0.1.zip",
+    "sha256": "4b2fca727515529cf327d49e08a6c889147051e8ec7df6957ca7edb15f986f06",
+    "ciRun": 36667984940,
     "publishedAt": "2026-09-30"
   },
   "notes": "foretforet.com (MakeShop) open-drop purchase macro. Open 2026-10-01 10:00 KST. Adds rows (url/size/qty, enable checkbox) to cart at the exact second, goes to order.html and stops for the customer to pay. See NOTES.md."
