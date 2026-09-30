@@ -546,6 +546,30 @@ class Engine:
                 pass
         return self.result
 
+    async def _show_waiting(self, page, open_ts: float) -> None:
+        """Local placeholder so the browser does not look dead (1.0.0 showed a
+        blank about:blank until 3 minutes before open). No network, display only."""
+        if open_ts - self.clock.now() <= config.PRELOAD_SECONDS:
+            return
+        fmt = lambda ts: datetime.fromtimestamp(ts, KST).strftime("%m월 %d일 %H:%M:%S")
+        html = (
+            "<html><head><meta charset='utf-8'><title>오픈 대기 중</title></head>"
+            "<body style='font-family:sans-serif;text-align:center;padding-top:80px;color:#333'>"
+            "<h2>포레포레 오픈 대기 중</h2>"
+            f"<p>오픈 시각 <b>{fmt(open_ts)}</b> (한국시간)</p>"
+            f"<p>{fmt(open_ts - config.PRELOAD_SECONDS)} 에 이 창에서 로그인하고 상품 페이지를 엽니다.</p>"
+            "<p id='left' style='font-size:28px;color:#c40'></p>"
+            "<p style='color:#888'>이 창을 닫지 마세요. 프로그램 화면에서 [중지]로 멈출 수 있습니다.</p>"
+            "<script>const t=" + str(int(open_ts * 1000)) + ";"
+            "function f(){let s=Math.max(0,Math.floor((t-Date.now())/1000));"
+            "const h=Math.floor(s/3600),m=Math.floor(s%3600/60);s=s%60;"
+            "document.getElementById('left').textContent='오픈까지 '+h+'시간 '+m+'분 '+s+'초';}"
+            "f();setInterval(f,1000);</script></body></html>")
+        try:
+            await page.set_content(html, timeout=5000)
+        except Exception:
+            pass
+
     async def purchase(self, cleanup_after: bool = False, hold: bool = True) -> dict:
         from playwright.async_api import async_playwright
         open_ts = parse_open_at(self.s.get("open_at") or config.DEFAULT_OPEN_AT)
@@ -563,6 +587,7 @@ class Engine:
         self.log(f"오픈 시각 {open_txt} (한국시간), 상품 {len(products)}개")
         async with async_playwright() as pw:
             page = await self._open(pw)
+            await self._show_waiting(page, open_ts)
             # wait until the preload window
             while not self.stopped() and self.clock.now() < open_ts - config.PRELOAD_SECONDS:
                 left = open_ts - self.clock.now()

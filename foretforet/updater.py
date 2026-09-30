@@ -149,9 +149,13 @@ def payload_root(extracted_dir, exe_name: str):
 
 
 class UpdaterThread(threading.Thread):
-    def __init__(self, status_cb=lambda *_: None) -> None:
+    def __init__(self, status_cb=lambda *_: None, busy_fn=lambda: False) -> None:
         super().__init__(daemon=True)
         self.status_cb = status_cb
+        # True while a login test / purchase run is going. The swap ends the
+        # process (os._exit), which would kill a run waiting for the drop, so
+        # the check is skipped until the run is over.
+        self.busy_fn = busy_fn
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -162,10 +166,17 @@ class UpdaterThread(threading.Thread):
             return  # 개발 모드에서는 의미 없음
         while not self._stop.is_set():
             try:
-                self._check_once()
+                if not self._busy():
+                    self._check_once()
             except Exception:
                 pass
             self._stop.wait(CHECK_SECONDS)
+
+    def _busy(self) -> bool:
+        try:
+            return bool(self.busy_fn())
+        except Exception:
+            return False
 
     # -- 확인 --------------------------------------------------------
     def _check_once(self) -> None:
@@ -201,6 +212,13 @@ class UpdaterThread(threading.Thread):
         floor = MIN_ZIP_BYTES if kind == "zip" else MIN_EXE_BYTES
         tmp_path = self._download(url, suffix, floor)
         if not tmp_path:
+            return
+
+        if self._busy():   # a run started while downloading: swap on a later check
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
             return
 
         import time as _t

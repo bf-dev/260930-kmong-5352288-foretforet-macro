@@ -178,8 +178,10 @@ class App:
             ttk.Label(self.rows_frame, text=t, style="Head.TLabel").grid(row=0, column=c, padx=2, sticky="w")
         btns = ttk.Frame(box)
         btns.pack(fill="x", pady=(4, 0))
-        ttk.Button(btns, text="+ 상품 추가", command=self.add_row).pack(side="left")
-        ttk.Button(btns, text="옵션 전체 불러오기", command=self.load_all).pack(side="left", padx=6)
+        self.btn_add = ttk.Button(btns, text="+ 상품 추가", command=self.add_row)
+        self.btn_add.pack(side="left")
+        self.btn_load_all = ttk.Button(btns, text="옵션 전체 불러오기", command=self.load_all)
+        self.btn_load_all.pack(side="left", padx=6)
         self.active_var = tk.StringVar()
         ttk.Label(btns, textvariable=self.active_var, foreground="#0a5").pack(side="right")
 
@@ -193,13 +195,14 @@ class App:
         tb.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.open_at = tk.StringVar(value=self.s.get("open_at") or config.DEFAULT_OPEN_AT)
         self.open_at.trace_add("write", lambda *_: self.schedule_save())
-        ttk.Entry(tb, textvariable=self.open_at, width=22).grid(row=0, column=0, sticky="w")
+        self.w_open_at = ttk.Entry(tb, textvariable=self.open_at, width=22)
+        self.w_open_at.grid(row=0, column=0, sticky="w")
         ttk.Label(tb, text="예: 2026-10-01 10:00:00").grid(row=0, column=1, padx=6, sticky="w")
         self.server_var = tk.StringVar(value="사이트 서버 시각: 확인 중")
         ttk.Label(tb, textvariable=self.server_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.left_var = tk.StringVar(value="")
         ttk.Label(tb, textvariable=self.left_var, foreground="#c40").grid(row=2, column=0, columnspan=2, sticky="w")
-        ttk.Label(tb, text="3분 전에 로그인·상품 페이지를 미리 열고, 정각에 담습니다.",
+        ttk.Label(tb, text="3분 전에 로그인·상품 페이지를 미리 열고, 정각에 담습니다.\n상품/오픈 시각은 [시작] 전에 정하세요 (실행 중에는 잠김).",
                   foreground="#666").grid(row=3, column=0, columnspan=2, sticky="w")
 
         # 3. login
@@ -371,6 +374,19 @@ class App:
 
     # ------------------------------------------------------------------ runs
     def _busy(self, busy: bool, status: str) -> None:
+        # the engine copies rows + open time when 시작 is pressed. In 1.0.0 they
+        # stayed editable and a mid-run edit was silently ignored (customer
+        # 5352288 set 13:02 and one row after 시작, the run kept 10-01 10:00 and
+        # the 6 default rows). Lock every input the run depends on.
+        flag = ["disabled"] if busy else ["!disabled"]
+        widgets = [self.w_open_at, self.btn_add, self.btn_load_all]
+        for r in self.rows:
+            widgets += [w for w in r.widgets() if w is not r.w_no]
+        for w in widgets:
+            try:
+                w.state(flag)
+            except Exception:
+                pass
         self.btn_start.configure(state="disabled" if busy else "normal")
         self.btn_login.configure(state="disabled" if busy else "normal")
         self.btn_stop.configure(state="normal" if busy else "disabled")
@@ -406,6 +422,9 @@ class App:
             messagebox.showwarning("무통장입금", "입금자명을 입력해 주세요.")
             return
         when = datetime.fromtimestamp(open_ts, KST).strftime("%m월 %d일 %H:%M:%S")
+        used = [i for i, r in enumerate(self.rows, 1) if r.active()]
+        self.log(f"시작: 오픈 {when}, 사용하는 줄 {', '.join(map(str, used))}번. "
+                 "실행 중에는 상품/시각이 잠깁니다 (바꾸려면 [중지] 후 수정하고 다시 시작).")
         self._busy(True, f"{when} 오픈 대기 중")
         self.engine = self._make_engine()
         self.engine.run_in_thread("buy")
@@ -423,10 +442,15 @@ class App:
                   "no-rows": "상품 없음", "error": "오류"}
         self._busy(False, labels.get(result, result))
         self.log(f"결과: {labels.get(result, result)}")
+        if mode == "login" and result == "login-ok":
+            self.log("로그인 테스트 창은 확인이 끝나면 자동으로 닫힙니다 (정상). "
+                     "실제 구매는 [시작]을 누르면 새 창에서 진행됩니다.")
         try:
             meta = {"mode": "login-test" if mode == "login" else "purchase", "result": result,
-                    "openAt": self.open_at.get(), "loginType": self.login_type.get(),
-                    "rows": [r.data() for r in self.rows],
+                    # what the run actually used (the engine snapshot), not the GUI now
+                    "openAt": (eng.s.get("open_at") if eng else self.open_at.get()),
+                    "loginType": (eng.s.get("login_type") if eng else self.login_type.get()),
+                    "rows": (eng.s.get("rows") if eng else [r.data() for r in self.rows]),
                     "serverOffsetMs": round(eng.clock.offset_ms if eng else 0)}
             self.run_diag.add_json("result.json", res)
             self.run_diag.upload(f"{meta['mode']}: {result}", meta)
@@ -442,12 +466,29 @@ class App:
         self.root.destroy()
 
 
+def _install_tk_guard(root: tk.Tk, app: "App", diag: Diagnostics) -> None:
+    """A button handler that raises must never close the window: show it in the
+    log, report it once, keep running."""
+    def report(exc_type, exc, tb):
+        try:
+            app.log(f"오류(화면): {exc_type.__name__}: {str(exc)[:200]} (프로그램은 계속 동작합니다)")
+        except Exception:
+            pass
+        try:
+            diag.upload_exception(exc, "tk-callback")
+        except Exception:
+            pass
+    root.report_callback_exception = report
+
+
 def run_gui(diag: Diagnostics) -> None:
     root = tk.Tk()
     app = App(root, diag)
+    _install_tk_guard(root, app, diag)
     try:
         from .updater import UpdaterThread
-        UpdaterThread(lambda m: app.ui(lambda: app.update_var.set(m))).start()
+        UpdaterThread(lambda m: app.ui(lambda: app.update_var.set(m)),
+                      busy_fn=lambda: app.engine is not None).start()
     except Exception:
         pass
     root.mainloop()
