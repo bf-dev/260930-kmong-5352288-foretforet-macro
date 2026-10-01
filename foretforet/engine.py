@@ -355,12 +355,48 @@ class Engine:
             last[:] = [txt]
         return True
 
+    async def _fetch_product(self, prod: Product) -> bytes | None:
+        """Raw GET of the product page with the browser's cookies; None on any error."""
+        try:
+            if not getattr(self, "_ua", None):
+                self._ua = await prod.page.evaluate("navigator.userAgent")
+            r = await self.ctx.request.get(parser.product_url(prod.branduid), timeout=10000,
+                                           headers={"User-Agent": self._ua})
+            return await r.body()
+        except Exception:
+            return None
+
     async def _wait_open(self, prod: Product, deadline: float) -> bool:
-        """Reload until the cart button shows. Never reload under a NetFunnel popup."""
+        """Reload until the cart button shows. Never reload under a NetFunnel popup.
+
+        While the shop hides the product (the page body is only the
+        "존재하지 않는 상품입니다" alert + redirect to '/'), poll it with a raw GET every
+        HIDDEN_POLL_MS instead of navigating the tab, so the alert/redirect never
+        costs a page load. As soon as the body is anything else, fall through to the
+        real page load (NetFunnel aware) below.
+        """
         page = prod.page
         last_nf: list = []
         polls = 0
+        hidden = 0
         while not self.stopped():
+            body = await self._fetch_product(prod)
+            if body is not None and parser.is_hidden_stub(body):
+                hidden += 1
+                if hidden == 1:
+                    self.diag.add_response("GET", parser.product_url(prod.branduid), 200,
+                                           body.decode("utf-8", "replace"))
+                if hidden == 1 or hidden % 150 == 0:
+                    self.log(f"[{prod.branduid}] 상품 페이지 아직 비공개(존재하지 않는 상품), "
+                             f"계속 다시 확인 중 ({hidden}회)")
+                if time.time() > deadline:
+                    self.log(f"[{prod.branduid}] 오픈 대기 시간 초과 (상품 비공개 상태)")
+                    return False
+                await asyncio.sleep(config.HIDDEN_POLL_MS / 1000.0)
+                continue
+            if hidden:
+                self.log(f"[{prod.branduid}] 상품 페이지 공개됨 ({hidden}회 확인 후), 바로 엽니다")
+                hidden = 0
             try:
                 await self._goto_product(prod)
                 while not self.stopped() and await self._netfunnel(page, prod.branduid, last_nf):
@@ -604,6 +640,9 @@ class Engine:
                 try:
                     await self._goto_product(prod)
                     await self._resolve(prod)
+                    if any("존재하지 않는" in d for d in self.dialogs[-2:]):
+                        self.log(f"[{prod.branduid}] 지금은 상품 페이지가 비공개입니다. "
+                                 f"오픈 시각부터 공개될 때까지 계속 다시 확인합니다")
                 except Exception as exc:
                     self.log(f"[{prod.branduid}] 미리 열기 실패: {type(exc).__name__}")
             # resync right before the drop, then wait for the exact moment

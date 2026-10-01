@@ -108,6 +108,13 @@ def parse_options(page: str) -> list[Option]:
     return opts
 
 
+def is_hidden_stub(body: bytes) -> bool:
+    """Product hidden by the shop before a drop: the whole response is
+    <script>alert('존재하지 않는 상품입니다.');parent.location.href='/';</script>."""
+    return len(body) < 1500 and b"alert(" in body and b"location.href" in body \
+        and b"optionlist" not in body
+
+
 def is_open(page: str) -> bool:
     """On sale = cart button present and no 'sold out / stopped' caution."""
     btn = re.search(r'class="shopdetailButtonTop"(.*?)</div>', page, re.S)

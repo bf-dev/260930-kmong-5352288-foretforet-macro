@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_SLUG = "foretforet-macro"
 APP_TITLE = "포레포레 오픈 구매 매크로"
 CUSTOMER_ID = "5352288"
@@ -36,7 +36,8 @@ DEFAULT_LOGIN_TYPE = "네이버"
 # Timing
 PRELOAD_SECONDS = 180          # log in / load product pages this long before open
 OPEN_POLL_MS = 500             # pause between reloads while the product is still closed (after open time)
-OPEN_WAIT_MAX_SECONDS = 600    # stop polling for "open" after this long past the open time
+OPEN_WAIT_MAX_SECONDS = 900    # stop polling for "open" after this long past the open time (15 min)
+HIDDEN_POLL_MS = 400           # re-check interval while the product page is the "존재하지 않는 상품" alert stub
 PRE_FIRE_RELOAD_MS = 150       # reload this many ms after open time on the server clock
 
 

@@ -35,9 +35,14 @@ def fetch_options(url: str) -> tuple[str, list[parser.Option], bool]:
     if not bu:
         raise ValueError("branduid 가 없는 주소입니다")
     r = requests.get(parser.product_url(bu), headers=UA, timeout=12)
+    if parser.is_hidden_stub(r.content):
+        return HIDDEN_TITLE, [], False
     r.encoding = r.apparent_encoding or "euc-kr"
     html = r.text
     return parser.parse_title(html), parser.parse_options(html), parser.is_open(html)
+
+
+HIDDEN_TITLE = "아직 비공개 상품 (오픈 시각부터 자동으로 계속 다시 확인)"
 
 
 class Row:

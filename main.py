@@ -13,6 +13,8 @@ import sys
 from foretforet import config
 from foretforet.reporter import Diagnostics, install_excepthook
 
+CONTROL_BRANDUID = "10254531"  # an always-on-sale product, used when every drop page is still hidden
+
 
 def _out(line: str = "") -> None:
     if sys.stdout is None:
@@ -43,6 +45,7 @@ def selftest(diag: Diagnostics) -> int:
     rows = config.active_rows(config.default_settings()["rows"])
     _out(f"SELFTEST v{config.APP_VERSION} customer {config.CUSTOMER_ID}: {len(rows)} default rows")
     seen: dict[str, tuple] = {}
+    hidden = parsed = 0
     for i, r in enumerate(rows, 1):
         bu = parser.branduid_of(r["url"])
         try:
@@ -53,13 +56,29 @@ def selftest(diag: Diagnostics) -> int:
             line = (f"row {i} {bu} want={r['option']} -> "
                     f"{opt.text if opt else None} stock={opt.stock if opt else None} "
                     f"open={is_open} options={len(opts)} {note}")
-            if not opts:
+            if not opts and title == gui.HIDDEN_TITLE:
+                line += " (hidden by the shop before the drop: alert stub, retried at open)"
+                hidden += 1
+            elif not opts:
                 ok = False
+            else:
+                parsed += 1
         except Exception as exc:
             # a network error (site unreachable from this machine) is reported, not
             # failed: CI runners outside Korea can be blocked. A parse failure on a
             # page that did load (no options) still fails the check above.
             line = f"row {i} {bu} fetch failed (network): {type(exc).__name__}: {exc}"
+        _out(line)
+        diag.log(line)
+    if hidden and not parsed:
+        # every drop page is hidden right now: prove the option parser on an on-sale control
+        try:
+            title, opts, is_open = gui.fetch_options(parser.product_url(CONTROL_BRANDUID))
+            line = f"control {CONTROL_BRANDUID} options={len(opts)} open={is_open}"
+            if not opts:
+                ok = False
+        except Exception as exc:
+            line = f"control {CONTROL_BRANDUID} fetch failed (network): {type(exc).__name__}: {exc}"
         _out(line)
         diag.log(line)
     info = Clock().sync(lambda m: diag.log(m))
