@@ -3,8 +3,10 @@
 Customer 배고픈숲3094, Neoworks id f799eaed-99e4-4036-b304-ed38c3166a86, Artifacts customerId `5352288`.
 Windows GUI (tkinter, Korean) that logs in to foretforet.com (MakeShop), waits for the drop
 (2026-10-01 10:00 KST by default), adds each enabled row (URL, size, qty) to the cart at the exact
-second, goes to `/shop/order.html` and STOPS so the customer pays by hand. Optional checkbox (off by
-default) completes the order with 무통장입금.
+second, goes to `/shop/order.html`, and (since 1.0.3) in one pass selects KakaoPay, ticks every
+required consent and clicks 결제하기 so the KakaoPay window/QR opens; the customer approves on the phone.
+무통장입금 is never used (customer: bank-transfer orders queue behind). Pay method combo defaults to
+카카오페이; the auto-click checkbox can be turned off to stop on order.html instead.
 
 ## Build / run
 - Repo: `bf-dev/260930-kmong-5352288-foretforet-macro` (`main`). CI: `.github/workflows/build.yml` on
@@ -12,7 +14,7 @@ default) completes the order with 무통장입금.
   `--selftest` (live option parse of the 6 default rows + clock sync + Artifacts upload),
   `ci/gui_screenshot.ps1` (`--guidemo`, shows unchecked row 2 and qty-0 row 5), sha256.
   Artifact `foretforet-macro` = zip + `screenshots/gui.png` + `selftest.log`.
-- Local: `.venv/bin/python -m pytest tests/ -q` (23 tests). Browser runs need
+- Local: `.venv/bin/python -m pytest tests/ -q` (34 tests). Browser runs need
   `xvfb-run -a -s "-screen 0 1400x1000x24"`, playwright 1.63.0, channel `chrome`.
 - Settings/profile: `%APPDATA%\ForetforetMacro` (`~/.config/ForetforetMacro` on Linux),
   persistent Playwright profile in `browser-profile/`. Password is never persisted.
@@ -107,3 +109,37 @@ Customer ran 1.0.0 at 12:57 KST: "창이 꺼져요", "blank", then at 13:03 it w
   tunnel), test item removed, Artifacts upload 200 matched=True. CI run 36794432008, zip sha256 d401b491...
 - Open question: whether NetFunnel fronts the raw GET at open. If NetFunnel serves its own page, the body is no
   longer the stub, so we fall through to the NetFunnel-aware tab loop, which is the safe direction.
+
+## 2026-10-01 drop ended basket-only (1.0.3)
+Evidence: 1.0.2 run ZIP of the 10:00 drop. Cart had 6 items, then 전체상품주문 alerted sold out / "재고가 현재
+1개", the app stopped on basket.html; on order.html the customer then hit "환불계좌 수집/설정 동의" and
+"개인정보 수집/이용 약관" alerts with the pay button doing nothing while stock sold out.
+- Basket: `parser.parse_stock_alerts` reads Makeshop's multi-line stock alerts (product names contain
+  brackets, so greedy match to the last `]`). The engine drops sold-out rows / lowers qty to the remaining
+  stock, then retries 전체상품주문 until order.html or nothing is left.
+- Order page: `engine.prepare_order(page, click)` runs `_JS_PREPARE_ORDER` once right after load:
+  default address, KakaoPay radio, every required consent checkbox (환불계좌, 개인정보, 주문/결제 동의,
+  전체동의), then calls the shop's own `send()`. Up to 3 tries; each waits 6 s for the KakaoPay popup or
+  an alert, and on a 동의/약관/환불계좌 alert it re-ticks and retries.
+- ROOT CAUSE of the dead pay button: order.html runs jQuery 1.7.2, where one throwing
+  `$(document).ready` callback aborts all later ones. A tracker (ChannelIO in footer.1.js, kakaoPixel,
+  google_tag_manager, MSLOG_code, request_init_spm_iframe) throws first, so (a) the pay-method radio
+  handler never binds and hidden `paymethod`/`simplepay_type` stay empty, (b) the ready callback that
+  checks `place[value=S]` and calls `addrclick()` (default address) is skipped, so send() alerts
+  "받는분의 성함을 입력하세요." Hardening: the prepare JS sets form1 `paymethod=C` +
+  `simplepay_type` (KAKAOPAY=KKP, PAYCO=PC, TOSS=TOS) itself, and calls `addrclick()` BEFORE ticking
+  consents (calling it after cleared pay_agree).
+- Offline replay (scratch, `~/workspace/kmong/tmp/ff103/replay/`, disposable): the real captured
+  order.html served via Playwright route with all POSTs mocked/blocked. With tracker stubs and with
+  `NOSTUB=1` (real tracker failure) both reach `form1` submit to `/ssllogin/order.html` target
+  HIDDEN_PROCESS with pm C / sp KKP. In the NOSTUB case addrclick still throws "Cannot convert
+  undefined or null to object" but receiver is filled first and send() submits.
+- Not done: a live logged-in end-to-end on foretforet (no test creds in env, and never approve KakaoPay).
+  Safe stop point for any future live test: the KakaoPay approval window.
+- Latency: product goto 10 s (`commit`), readyState wait 8 s, option select wait 3 s, no 40 s retry
+  stalls. Armed heartbeat: one JSON post (`[heartbeat] ...`) when armed, via `reporter.heartbeat`.
+- Tests: `tests/test_order_flow.py` covers unbound radio handler and aborted-ready default address.
+- CI run 36803894157 (commit 88fe236). Zip 54,374,087 bytes, sha256
+  68131ea6d654373fad25d1fac0f3bb8a709614cd4191522dc46e5b468f0c431a, published to
+  https://static.neoworks.us/5352288/foretforet-macro-1.0.3.zip, manifest updated with FORCE=1.
+  Artifacts: CI selftest row and engineer verification row arrived (matched=true).
