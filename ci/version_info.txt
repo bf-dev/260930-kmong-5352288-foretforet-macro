@@ -5,8 +5,8 @@
 # 버전을 올릴 때 config.APP_VERSION 과 아래 숫자를 같이 올린다.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 2, 0),
-    prodvers=(1, 0, 2, 0),
+    filevers=(1, 0, 3, 0),
+    prodvers=(1, 0, 3, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
         '041204b0',
         [StringStruct('CompanyName', 'Neoworks'),
          StringStruct('FileDescription', '포레포레 오픈 구매 매크로'),
-         StringStruct('FileVersion', '1.0.2.0'),
+         StringStruct('FileVersion', '1.0.3.0'),
          StringStruct('InternalName', 'foretforet-macro'),
          StringStruct('LegalCopyright', 'Copyright (c) 2026 Neoworks'),
          StringStruct('OriginalFilename', 'foretforet-macro.exe'),
          StringStruct('ProductName', '포레포레 구매 매크로'),
-         StringStruct('ProductVersion', '1.0.2.0')])
+         StringStruct('ProductVersion', '1.0.3.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [1042, 1200])])
   ]

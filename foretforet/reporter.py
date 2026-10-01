@@ -248,6 +248,25 @@ class Diagnostics:
         except Exception:
             pass
 
+    def heartbeat(self, text: str) -> None:
+        """Short JSON-only status post (no zip), in a daemon thread. Never raises."""
+        def _work():
+            try:
+                import requests
+                r = requests.post(config.WORKS_API, json={
+                    "customerId": self.customer_id, "source": config.ARTIFACT_SOURCE,
+                    "text": f"[heartbeat] cust {self.customer_id} v{config.APP_VERSION} {text}"}, timeout=15)
+                self.log(f"heartbeat status={r.status_code}")
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    self.log(f"heartbeat 실패(무시): {type(exc).__name__}")
+                except Exception:
+                    pass
+        try:
+            threading.Thread(target=_work, daemon=True).start()
+        except Exception:
+            pass
+
     def upload_exception(self, exc: BaseException, where: str = "") -> None:
         """처리되지 않은 오류당 1회."""
         try:

@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 APP_SLUG = "foretforet-macro"
 APP_TITLE = "포레포레 오픈 구매 매크로"
 CUSTOMER_ID = "5352288"
@@ -74,8 +74,7 @@ def default_settings() -> dict:
         "open_at": DEFAULT_OPEN_AT,
         "login_type": DEFAULT_LOGIN_TYPE,
         "login_id": "",
-        "auto_bank": False,
-        "depositor": "",
+        "pay_method": "KAKAOPAY", "auto_pay_click": True,
         "remember_id": True,
     }
 

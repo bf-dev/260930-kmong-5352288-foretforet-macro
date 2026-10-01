@@ -42,6 +42,8 @@ def fetch_options(url: str) -> tuple[str, list[parser.Option], bool]:
     return parser.parse_title(html), parser.parse_options(html), parser.is_open(html)
 
 
+# order.html radio_paymethod values. 무통장입금 (B) is deliberately absent.
+PAY_METHODS = {"카카오페이": "KAKAOPAY", "신용카드": "C", "토스페이": "TOSS", "페이코": "PAYCO"}
 HIDDEN_TITLE = "아직 비공개 상품 (오픈 시각부터 자동으로 계속 다시 확인)"
 
 
@@ -238,14 +240,18 @@ class App:
         # 4. payment
         pb = ttk.LabelFrame(outer, text=" 4. 결제 ", padding=6)
         pb.pack(fill="x", pady=4)
-        self.auto_bank = tk.BooleanVar(value=bool(self.s.get("auto_bank", False)))
-        self.auto_bank.trace_add("write", lambda *_: self.schedule_save())
-        ttk.Checkbutton(pb, text="무통장입금으로 주문까지 자동 완료 (끄면 주문서에서 멈추고 직접 결제)",
-                        variable=self.auto_bank).pack(side="left")
-        ttk.Label(pb, text="   입금자명").pack(side="left")
-        self.depositor = tk.StringVar(value=self.s.get("depositor") or "")
-        self.depositor.trace_add("write", lambda *_: self.schedule_save())
-        ttk.Entry(pb, textvariable=self.depositor, width=12).pack(side="left", padx=4)
+        # 1.0.3: 무통장입금 is never used (bank-transfer orders queue behind
+        # card/easy-pay orders, customer 5352288). Default KakaoPay.
+        ttk.Label(pb, text="결제수단").pack(side="left")
+        cur = self.s.get("pay_method") or "KAKAOPAY"
+        self.pay_method = tk.StringVar(value=next((k for k, v in PAY_METHODS.items() if v == cur), "카카오페이"))
+        self.pay_method.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Combobox(pb, textvariable=self.pay_method, values=list(PAY_METHODS), state="readonly",
+                     width=10).pack(side="left", padx=(4, 10))
+        self.auto_pay_click = tk.BooleanVar(value=bool(self.s.get("auto_pay_click", True)))
+        self.auto_pay_click.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Checkbutton(pb, text="동의 자동 체크 후 [결제하기] 자동 클릭 (휴대폰 승인 창까지)",
+                        variable=self.auto_pay_click).pack(side="left")
 
         # 5. controls + log
         cb = ttk.Frame(outer)
@@ -358,8 +364,8 @@ class App:
             "open_at": self.open_at.get().strip(),
             "login_type": self.login_type.get(),
             "login_id": self.login_id.get().strip(),
-            "auto_bank": bool(self.auto_bank.get()),
-            "depositor": self.depositor.get().strip(),
+            "pay_method": PAY_METHODS.get(self.pay_method.get(), "KAKAOPAY"),
+            "auto_pay_click": bool(self.auto_pay_click.get()),
             "remember_id": bool(self.remember_id.get()),
         }
 
@@ -422,9 +428,6 @@ class App:
             return
         if not any(r.active() for r in self.rows):
             messagebox.showwarning("상품", "체크되어 있고 수량이 1 이상인 상품이 없습니다.")
-            return
-        if self.auto_bank.get() and not self.depositor.get().strip():
-            messagebox.showwarning("무통장입금", "입금자명을 입력해 주세요.")
             return
         when = datetime.fromtimestamp(open_ts, KST).strftime("%m월 %d일 %H:%M:%S")
         used = [i for i, r in enumerate(self.rows, 1) if r.active()]

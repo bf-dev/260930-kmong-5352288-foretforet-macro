@@ -10,10 +10,13 @@ Flow for one run:
   5. reload all product pages at once; while the product is still closed poll
      lightly; while a NetFunnel queue popup is up never reload, just log the count
   6. per product: select every wanted option, set its quantity, send_multi()
-  7. basket: tick only the items this run added, order them, STOP on order.html
-     (card payment is done by the customer; 무통장입금 auto-complete is opt-in)
+  7. basket: tick only the items this run added, order them; a sold-out item is
+     dropped and a short-stock item is cut to what is left, then order again
+  8. order.html: KakaoPay + every required consent in one pass, press 결제하기 so
+     the KakaoPay QR / approval window opens
 
-Nothing here ever submits a card payment.
+The payment itself is always approved by the customer on the phone; nothing here
+approves a payment, and 무통장입금 is never used.
 """
 from __future__ import annotations
 
@@ -62,9 +65,25 @@ _JS_BASKET = """() => Array.from(document.querySelectorAll('input[name="basketch
   let item = {};
   try { item = JSON.parse(items[i].value); } catch (e) {}
   const row = c.closest('tr') || c.closest('li') || c.parentElement;
+  const form = document.getElementById('basket_form' + i) || c.closest('form');
+  const q = n => { const e = form ? form.querySelector('input[name="' + n + '"]') : null; return e ? e.value : ''; };
+  let name = q('product_brandname');
+  if (!name) { try { name = decodeURIComponent(item.prod_name || ''); } catch (e) { name = item.prod_name || ''; } }
   return {i, uid: item.uid || '', cart_id: String(item.cart_id || ''), chk: c.getAttribute('chk_data_uid') || '',
+          name, amount: parseInt(q('amount') || '0', 10) || 0,
           text: row ? row.innerText.replace(/\\s+/g, ' ').trim().slice(0, 160) : ''};
 })"""
+
+# Set a basket row quantity and save it with Makeshop's own cart_update_action().
+_JS_SET_AMOUNT = """([i, n]) => {
+  const f = document.getElementById('basket_form' + i);
+  if (!f) return false;
+  const a = f.querySelector('input[name="amount"]');
+  if (!a) return false;
+  a.value = String(n);
+  if (typeof cart_update_action === 'function') { cart_update_action(i, 'upd'); return true; }
+  return false;
+}"""
 
 
 def parse_open_at(text: str) -> float:
@@ -338,8 +357,23 @@ class Engine:
                 self.log(f"[{w.row_no}번] {prod.branduid} '{w.wanted}': {note}")
 
     async def _goto_product(self, prod: Product) -> None:
-        await prod.page.goto(parser.product_url(prod.branduid), wait_until="domcontentloaded",
-                             timeout=30000)
+        """Do not wait for domcontentloaded: at the drop the page body is there long
+        before the third-party tags finish (1.0.2 lost 30 s per product on that
+        TimeoutError). Return as soon as the option select and send_multi exist."""
+        try:
+            await prod.page.goto(parser.product_url(prod.branduid), wait_until="commit", timeout=10000)
+        except Exception as exc:
+            if "Timeout" not in type(exc).__name__:
+                raise
+        try:
+            await prod.page.wait_for_function(
+                "() => (typeof window.send_multi === 'function' && "
+                "typeof window.change_option === 'function' && "
+                "!!document.querySelector('select[name=\"optionlist[]\"]') && "
+                "!!document.querySelector('.shopdetailButtonTop')) || "
+                "document.readyState !== 'loading'", timeout=8000, polling=100)
+        except Exception:
+            pass
 
     async def _netfunnel(self, page, tag: str, last: list) -> bool:
         """True while a NetFunnel queue popup is visible; logs the position once per change."""
@@ -435,7 +469,7 @@ class Engine:
         sel = page.locator('select[name="optionlist[]"]').first
         for idx, w in enumerate(picks):
             await sel.select_option(w.option.value)
-            await page.wait_for_selector(f"#MS_amount_basic_{idx}", state="attached", timeout=5000)
+            await page.wait_for_selector(f"#MS_amount_basic_{idx}", state="attached", timeout=3000)
             if w.qty != 1:
                 await page.evaluate(
                     "([i, q]) => { const e = document.getElementById('MS_amount_basic_' + i);"
@@ -443,11 +477,11 @@ class Engine:
                     [idx, w.qty])
         before = len(self.basket_responses)
         await page.evaluate("window._is_send_multi = false; send_multi('', '')")
-        t_end = time.time() + 12
+        t_end = time.time() + 8
         last_nf: list = []
         while time.time() < t_end and len(self.basket_responses) == before and not self.stopped():
             if await self._netfunnel(page, prod.branduid, last_nf):
-                t_end = time.time() + 12   # queued: keep waiting, never resend
+                t_end = time.time() + 8   # queued: keep waiting, never resend
             await asyncio.sleep(0.1)
         if len(self.basket_responses) == before:
             prod.message = "장바구니 응답 없음"
@@ -485,45 +519,112 @@ class Engine:
             if "품절" in prod.message or "재고" in prod.message:
                 return
             self.log(f"[{prod.branduid}] 다시 시도 ({attempt + 2}/3)")
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.2)
 
     # ---------------------------------------------------------------- basket
     async def read_basket(self, page) -> list[dict]:
-        await page.goto(BASKET_URL, wait_until="domcontentloaded")
+        await page.goto(BASKET_URL, wait_until="domcontentloaded", timeout=15000)
+        return await self._basket_items(page)
+
+    async def _basket_items(self, page) -> list[dict]:
         try:
             return await page.evaluate(_JS_BASKET)
         except Exception:
             return []
 
-    async def _select_ours(self, page, items: list[dict], products: list[Product]) -> int:
+    def _ours(self, items: list[dict], products: list[Product]) -> list[dict]:
+        """Rows this run added. basket_uid_array from the add response holds branduids,
+        so match on cart_id when we have real cart ids, otherwise on branduid."""
         cart_ids = {c for p in products for c in p.cart_ids}
         uids = {p.branduid for p in products if p.added}
-        keep = [it["i"] for it in items
-                if (cart_ids and it["cart_id"] in cart_ids) or (not cart_ids and it["uid"] in uids)]
-        if not keep and uids:
-            keep = [it["i"] for it in items if it["uid"] in uids]
+        keep = [it for it in items if it["cart_id"] in cart_ids]
+        if not keep:
+            keep = [it for it in items if it["uid"] in uids]
+        return keep
+
+    async def _select_ours(self, page, items: list[dict], products: list[Product],
+                           exclude: set | None = None) -> int:
+        exclude = exclude or set()
+        keep = [it["i"] for it in self._ours(items, products)
+                if it.get("name") not in exclude and it["cart_id"] not in exclude]
         await page.evaluate(
             "(keep) => document.querySelectorAll('input[name=\"basketchks\"]').forEach("
             "(c, i) => { c.checked = keep.indexOf(i) >= 0; })", keep)
         return len(keep)
 
+    async def _try_order(self, page) -> None:
+        """multi_order('') -> order.html. On a stock problem the shop alerts and stays on
+        (or reloads) basket.html, so a missing navigation is not an error here."""
+        try:
+            async with page.expect_navigation(timeout=12000):
+                await page.evaluate("window._is_multi_order = false; multi_order('')")
+        except Exception:
+            pass
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+
     async def go_order(self, page, products: list[Product]) -> str:
+        """Basket -> order.html. Sold-out rows are dropped from the selection and
+        rows with less stock than ordered are cut down to what is left, then the
+        order is retried, so one sold-out item never blocks the rest."""
         items = await self.read_basket(page)
         self.log(f"장바구니 {len(items)}개 항목")
         for it in items:
             self.log(f"  - {it['text'][:100]}")
         await self._snapshot(page, "basket")
-        n = await self._select_ours(page, items, products)
-        if n == 0:
-            self.log("이번에 담은 상품을 장바구니에서 찾지 못했습니다")
-            return page.url
-        others = len(items) - n
-        if others:
-            self.log(f"기존 장바구니 상품 {others}개는 주문에서 제외 (그대로 둠)")
-        async with page.expect_navigation(timeout=20000):
-            await page.evaluate("window._is_multi_order = false; multi_order('')")
-        await page.wait_for_load_state("domcontentloaded")
-        await self._snapshot(page, "order_page")
+        exclude: set = set()
+        blind = 0
+        for attempt in range(1, 7):
+            if self.stopped():
+                break
+            if attempt > 1:
+                if "basket.html" not in page.url:
+                    await self.read_basket(page)
+                items = await self._basket_items(page)
+            n = await self._select_ours(page, items, products, exclude)
+            if n == 0:
+                self.log("주문할 상품이 남아 있지 않습니다 (모두 품절이거나 장바구니에서 찾지 못함)")
+                return page.url
+            if attempt == 1:
+                others = len(items) - n
+                if others:
+                    self.log(f"기존 장바구니 상품 {others}개는 주문에서 제외 (그대로 둠)")
+            mark = len(self.dialogs)
+            await self._try_order(page)
+            if "order.html" in page.url:
+                await self._snapshot(page, "order_page")
+                if exclude:
+                    self.log(f"품절 {len(exclude)}개 제외하고 주문서로 이동")
+                return page.url
+            alerts = self.dialogs[mark:]
+            found = [x for msg in alerts for x in parser.parse_stock_alerts(msg)]
+            if not found:
+                blind += 1
+                self.log(f"주문서로 넘어가지 않았습니다 ({attempt}회), 다시 시도")
+                if blind >= 2:
+                    break
+                continue
+            if "basket.html" not in page.url or not await self._basket_items(page):
+                await self.read_basket(page)
+            items = await self._basket_items(page)
+            by_name = {it["name"]: it for it in self._ours(items, products)}
+            for name, kind, left in found:
+                it = by_name.get(name)
+                if kind == "stock" and left > 0 and it and it["amount"] > left:
+                    self.log(f"재고 {left}개만 남음: {name[-30:]} 수량 {it['amount']} -> {left}")
+                    try:
+                        await page.evaluate(_JS_SET_AMOUNT, [it["i"], left])
+                        await asyncio.sleep(1.2)
+                    except Exception as exc:
+                        self.log(f"수량 변경 실패: {type(exc).__name__}, 이 상품은 제외")
+                        exclude.add(name)
+                else:
+                    if name not in exclude:
+                        self.log(f"품절, 주문에서 제외: {name[-30:]}")
+                    exclude.add(name)
+        await self._snapshot(page, "basket_final")
         return page.url
 
     async def remove_from_cart(self, page, products: list[Product]) -> int:
@@ -535,24 +636,86 @@ class Engine:
             await asyncio.sleep(2.5)
         return n
 
-    async def _auto_bank(self, page) -> bool:
-        """Opt-in: pick 무통장입금, fill the depositor, tick the agreements, submit.
-        Card/INICIS is never touched."""
-        dep = (self.s.get("depositor") or "").strip()
-        self.log("무통장입금 자동 완료 시도")
-        ok = await page.evaluate(_JS_PICK_BANK, dep)
-        self.log(f"무통장입금 선택 결과: {ok}")
-        if not ok or not ok.get("picked"):
-            self.log("무통장입금 선택 실패: 화면에서 직접 결제해 주세요")
-            return False
-        if not ok.get("submit"):
-            self.log("결제 버튼을 찾지 못했습니다: 화면에서 직접 눌러 주세요")
-            return False
-        await page.evaluate(ok["submit"])
-        await asyncio.sleep(3)
-        await self._snapshot(page, "after_bank_submit")
-        self.log(f"주문 제출 후 주소: {page.url}")
-        return True
+    # ------------------------------------------------------------ order page
+    async def _fill_order(self, page) -> dict:
+        try:
+            return await page.evaluate(_JS_PREPARE_ORDER, self.s.get("pay_method") or "KAKAOPAY")
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+
+    async def _pay_window(self, page, before: set):
+        """The KakaoPay window: a new 'orderpay' popup, or the in-page #payiframe layer."""
+        for p in self.ctx.pages:
+            if p is not page and id(p) not in before:
+                return p
+        try:
+            if await page.evaluate("() => { const f = document.getElementById('payiframe');"
+                                   " if (!f) return false; const r = f.getBoundingClientRect();"
+                                   " return r.width > 0 && r.height > 0; }"):
+                return page
+        except Exception:
+            pass
+        return None
+
+    async def prepare_order(self, page, click: bool = True) -> dict:
+        """Right after order.html loads: choose KakaoPay, tick every required consent,
+        then press 결제하기 so the KakaoPay QR / approval window opens. The customer
+        approves on the phone; this never approves anything itself. A missing-consent
+        alert is fixed by ticking the box again and pressing once more."""
+        out: dict = {"method": self.s.get("pay_method") or "KAKAOPAY", "clicked": False, "window": False}
+        st = await self._fill_order(page)
+        out["fill"] = st
+        if st.get("error") or not st.get("radio"):
+            self.log(f"카카오페이 선택 실패: {st.get('error') or '결제수단 버튼 없음'}. 화면에서 직접 골라 주세요")
+        else:
+            self.log(f"결제수단 카카오페이 선택, 동의 {len(st.get('checked') or [])}개 체크 "
+                     f"(paymethod={st.get('paymethod')}, simplepay={st.get('simplepay')})")
+        if not click:
+            self.log("결제 버튼 자동 클릭 꺼짐: 화면에서 [결제하기]를 눌러 주세요")
+            return out
+        for attempt in range(1, 4):
+            if self.stopped():
+                break
+            mark = len(self.dialogs)
+            before = {id(p) for p in self.ctx.pages}
+            try:
+                await page.evaluate("() => { if (typeof send === 'function') { send(); return; }"
+                                    " const b = document.querySelector('a.btn_Red.all-ok, a[href*=\"send()\"]');"
+                                    " if (b) b.click(); }")
+                out["clicked"] = True
+            except Exception as exc:
+                self.log(f"결제 버튼 실행 오류: {type(exc).__name__}")
+            win = None
+            end = time.time() + 6
+            while time.time() < end and not self.stopped():
+                win = await self._pay_window(page, before)
+                if win is not None or len(self.dialogs) > mark:
+                    break
+                await asyncio.sleep(0.1)
+            alerts = self.dialogs[mark:]
+            if win is None and alerts:
+                if any(re.search(r"동의|약관|환불계좌", a) for a in alerts):
+                    self.log(f"동의 누락 알림, 다시 체크하고 재시도 ({attempt}/3)")
+                    out["fill"] = await self._fill_order(page)
+                    continue
+                self.log("결제창 대신 알림이 떴습니다. 화면을 확인해 주세요")
+                break
+            if win is None:
+                win = await self._pay_window(page, before)
+            if win is not None:
+                out["window"] = True
+                if win is not page:
+                    self._attach(win)
+                    try:
+                        await win.bring_to_front()
+                    except Exception:
+                        pass
+                self.log("카카오페이 결제창이 열렸습니다. 휴대폰에서 승인해 주세요")
+                await self._snapshot(page, "order_after_pay_click")
+                return out
+            self.log(f"결제창이 아직 안 열렸습니다 ({attempt}/3)")
+        await self._snapshot(page, "order_pay_not_opened")
+        return out
 
     # ------------------------------------------------------------------ runs
     async def _open(self, pw):
@@ -645,6 +808,16 @@ class Engine:
                                  f"오픈 시각부터 공개될 때까지 계속 다시 확인합니다")
                 except Exception as exc:
                     self.log(f"[{prod.branduid}] 미리 열기 실패: {type(exc).__name__}")
+            # armed heartbeat: one small JSON post so a dead PC / failed login is
+            # visible before the drop, not after. Non-blocking, never raises.
+            try:
+                ready = [f"{p.branduid}:{'title' if p.title else 'hidden'}" for p in products]
+                self.diag.heartbeat(
+                    f"armed: login={'ok' if logged else 'no'}, open={open_txt} KST, "
+                    f"pay={self.s.get('pay_method') or 'KAKAOPAY'}, "
+                    f"autoclick={bool(self.s.get('auto_pay_click', True))}, products={', '.join(ready)}")
+            except Exception:
+                pass
             # resync right before the drop, then wait for the exact moment
             if open_ts - self.clock.now() > 20:
                 while not self.stopped() and self.clock.now() < open_ts - 20:
@@ -677,18 +850,20 @@ class Engine:
             self.log(f"주문서 도착: {url}" if reached else f"주문서가 아닌 화면: {url}")
             result = {"result": "order-page" if reached else "basket-only", "orderUrl": url,
                       "added": [p.branduid for p in added]}
-            if reached and self.s.get("auto_bank") and not cleanup_after:
-                result["autoBank"] = await self._auto_bank(page)
+            if reached:
+                # one pass, no waiting: KakaoPay + consents + 결제하기 (tests never click)
+                click = bool(self.s.get("auto_pay_click", True)) and not cleanup_after
+                result["pay"] = await self.prepare_order(page, click=click)
             if cleanup_after:
                 n = await self.remove_from_cart(page, products)
                 left = await self.read_basket(page)
                 self.log(f"테스트 정리: {n}개 삭제, 남은 항목 {len(left)}개")
                 result["cleanup"] = {"removed": n, "left": len(left)}
                 hold = False
-            elif reached:
-                page_front = page
+            elif reached and not (result.get("pay") or {}).get("window"):
+                # no KakaoPay popup: show the order page. With a popup, leave it on top.
                 try:
-                    await page_front.bring_to_front()
+                    await page.bring_to_front()
                 except Exception:
                     pass
             return await self._finish(result, hold=hold)
@@ -696,7 +871,7 @@ class Engine:
     async def _finish(self, result: dict, hold: bool = False) -> dict:
         self.result = result
         if hold and not self.stopped():
-            await self._hold_open("주문서에서 결제를 진행해 주세요. 끝나면 [중지]를 누르거나 브라우저를 닫으세요.")
+            await self._hold_open("카카오페이 결제창에서 휴대폰으로 승인해 주세요 (창이 없으면 주문서에서 [결제하기]). 끝나면 [중지]를 누르거나 브라우저를 닫으세요.")
         try:
             if self.ctx:
                 await self.ctx.close()
@@ -731,31 +906,75 @@ class Engine:
         return t
 
 
-# Order page: choose 무통장입금 (bank transfer) and fill the depositor. The
-# selectors come from the Makeshop order.html captured during the logged-in
-# test; each lookup is defensive because the skin can differ.
-_JS_PICK_BANK = """(dep) => {
-  const out = {picked: false, depositor: false, agreed: 0, submit: null};
-  const radios = Array.from(document.querySelectorAll('input[type=radio]'));
-  let bank = radios.find(r => /^(B|bank|online)$/i.test(r.value) && /pay|paytype|pay_type|radio_paymethod/i.test(r.name));
-  if (!bank) {
-    bank = radios.find(r => {
-      const lab = (r.closest('label') || r.parentElement || {}).innerText || '';
-      const f = r.id ? document.querySelector('label[for="' + r.id + '"]') : null;
-      return /무통장/.test(lab + ' ' + (f ? f.innerText : ''));
-    });
+# Order page (Makeshop order.html, captured 2026-10-01): choose the payment radio
+# through the shop's own jQuery click handler (it sets paymethod=C and
+# simplepay_type=KKP for KAKAOPAY and resets pay_agree via pay_agree_init()), then
+# tick the consents sendok2() checks. Untouched on purpose: same / modify_address
+# (address copy, fires a confirm), reserve / coupon boxes.
+_JS_PREPARE_ORDER = """(method) => {
+  const out = {radio: false, checked: [], paymethod: '', simplepay: ''};
+  const f = document.forms['form1'] || document.getElementById('order_form') || document;
+  const r = f.querySelector('input[name="radio_paymethod"][value="' + method + '"]');
+  if (r) {
+    if (!r.checked || !window.__ff_paid_once) {
+      try {
+        if (window.jQuery) { jQuery(r).prop('checked', true).trigger('click'); }
+        else { r.click(); }
+      } catch (e) { try { r.click(); } catch (e2) {} }
+      window.__ff_paid_once = true;
+    }
+    f.querySelectorAll('input[name="radio_paymethod"]').forEach(x => { x.checked = (x === r); });
+    out.radio = true;
   }
-  if (bank) { bank.click(); bank.checked = true; bank.dispatchEvent(new Event('change', {bubbles: true})); out.picked = true; }
-  const sel = document.querySelector('select[name=pay_data], select[name=bank], select[name=bankname], select[name=account]');
-  if (sel && sel.options.length > 1 && !sel.value) { sel.selectedIndex = 1; sel.dispatchEvent(new Event('change', {bubbles: true})); }
-  const d = document.querySelector('input[name=bankname], input[name=pay_name], input[name=bank_name], input[name=sender], input[name=deposit_name]');
-  if (d && dep) { d.value = dep; d.dispatchEvent(new Event('change', {bubbles: true})); out.depositor = true; }
-  document.querySelectorAll('input[type=checkbox]').forEach(c => {
-    const t = ((c.closest('label') || c.parentElement || {}).innerText || '') + (c.name || '') + (c.id || '');
-    if (/동의|agree/i.test(t) && !c.checked) { c.click(); out.agreed++; }
-  });
-  const btn = Array.from(document.querySelectorAll('a, button, input[type=button], input[type=submit]'))
-    .find(b => /결제하기|주문하기|구매하기/.test((b.innerText || b.value || '').trim()));
-  if (btn) { window.__ff_submit_btn = btn; out.submit = "window.__ff_submit_btn.click()"; }
+  // The same aborted ready chain also skips "place=S; setTimeout(addrclick, 1000)", which
+  // fills the member's default address; without it send() stops at "받는분의 성함을 입력하세요".
+  // Run the shop's own addrclick() (it reads the shop-side stored address, we copy nothing).
+  const rcv = document.querySelector('input[name="receiver"]');
+  const def = document.querySelector('input[name="place"][value="S"]');
+  if (rcv && !String(rcv.value || '').trim() && def && typeof addrclick === 'function') {
+    try {
+      def.checked = true;
+      addrclick();
+      out.address = String(rcv.value || '').trim() ? 'default' : 'empty';
+    } catch (e) { out.address = 'error: ' + String(e && e.message || e).slice(0, 80); }
+  }
+  const ids = ['new_privacy_ok', 'privacy_ok', 'provider_privacy_agree_ok', 'recall_policy_ok',
+               'contract_ok', 'pay_agree', 'user_age_check', 'before_pay_agree', 'refund_info_agree'];
+  const tick = () => {
+    ids.forEach(n => {
+      const els = document.querySelectorAll('#' + n + ', input[type=checkbox][name="' + n + '"]');
+      els.forEach(c => {
+        if (c.type === 'checkbox' && !c.disabled && !c.checked) {
+          c.checked = true;
+          try { c.dispatchEvent(new Event('change', {bubbles: true})); } catch (e) {}
+          if (out.checked.indexOf(n) < 0) out.checked.push(n);
+        }
+      });
+    });
+  };
+  tick();
+  const all = document.getElementById('all_ok');
+  if (all && !all.disabled) {
+    all.checked = true;
+    try { if (typeof all_check === 'function') all_check(); } catch (e) {}
+    if (out.checked.indexOf('all_ok') < 0) out.checked.push('all_ok');
+  }
+  try { if (typeof all_entire_agree === 'function') all_entire_agree(); } catch (e) {}
+  tick();
+  if (all) all.checked = true;
+  const pm = f.querySelector ? f.querySelector('input[name="paymethod"]') : null;
+  const sp = f.querySelector ? f.querySelector('input[name="simplepay_type"]') : null;
+  // Makeshop binds the radio handler inside a jQuery ready callback; if an earlier
+  // ready callback throws (a tracker script failing), the handler never binds and
+  // paymethod stays empty. Apply the same mapping the handler would.
+  const simple = {KAKAOPAY: 'KKP', PAYCO: 'PC', TOSS: 'TOS'};
+  if (r && pm) {
+    const want = simple[method] ? 'C' : method;
+    if (pm.value !== want) { pm.value = want; out.fixed = true; }
+    if (sp && simple[method] && sp.value !== simple[method]) { sp.value = simple[method]; out.fixed = true; }
+  }
+  out.paymethod = pm ? pm.value : '';
+  out.simplepay = sp ? sp.value : '';
+  out.selected = (f.querySelector('input[name="radio_paymethod"]:checked') || {}).value || '';
   return out;
 }"""

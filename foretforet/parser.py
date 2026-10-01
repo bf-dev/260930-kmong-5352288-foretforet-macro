@@ -175,3 +175,28 @@ def match_option(wanted: str, options: list[Option]) -> tuple[Option | None, str
     if len(size_hits) > 1:
         return None, f"'{wanted}' 여러 색상에 있음, 색상을 적어주세요"
     return None, f"'{wanted}' 일치하는 옵션 없음"
+
+
+_STOCK_LINE = re.compile(
+    r"^\s*\[(.*)\]\s*(선택된 상품/옵션은 품절|상품은 다른 고객의 주문|상품의 재고가 현재\s*(\d+)\s*개)")
+
+
+def parse_stock_alerts(msg: str) -> list[tuple[str, str, int]]:
+    """Basket stock alerts from Makeshop's multi_order / cart update.
+
+    One alert may carry one line per product, and product names contain brackets
+    ("[FALL26[던스스웨덴]블랙 ...-DS26KABDS0010CBK]상품은 ..."), so the name is the
+    greedy match up to the last "]" before the reason. Returns
+    [(product_brandname, "soldout" | "stock", remaining)], remaining is 0 for sold out.
+    """
+    out: list[tuple[str, str, int]] = []
+    for line in (msg or "").splitlines():
+        m = _STOCK_LINE.search(line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if m.group(3) is not None:
+            out.append((name, "stock", int(m.group(3))))
+        else:
+            out.append((name, "soldout", 0))
+    return out
