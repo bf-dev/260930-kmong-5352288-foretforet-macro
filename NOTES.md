@@ -87,3 +87,23 @@ Customer ran 1.0.0 at 12:57 KST: "창이 꺼져요", "blank", then at 13:03 it w
 - Rejected in this release (drop is 2026-10-01 10:00): logging in early at 시작 and a keep-warm
   navigation loop. They change login/timing behaviour; not shipped.
 - Tk callback errors are logged + uploaded (`_install_tk_guard`) instead of being silent.
+
+## 2026-10-01 drop pages hidden behind "존재하지 않는 상품" (1.0.2)
+
+- From about 09:00 KST on drop day, all 5 drop branduids (10279528, 10279589, 10279533, 10279540, 10240351)
+  return 200 with only `<script>alert('존재하지 않는 상품입니다.');parent.location.href='/';</script>`
+  (111 bytes), desktop and mobile. Any nonexistent branduid (e.g. 10999999) returns the same body, so it is
+  the test stand-in. Control 10254531 stays a full page. Detector: `parser.is_hidden_stub(body)`.
+- What 1.0.1 did (live run, tmp e2e `alert_run.py`, open +60 s): the preload logs "옵션 없음" and keeps the row.
+  After open, `_wait_open` re-navigates the tab. The alert plus redirect to '/' made `goto(domcontentloaded)` hit
+  30 s TimeoutErrors, so it got only about 4 to 6 checks per row in 70 s. When the fake page was un-hidden, it took
+  about 42 s before the item was carted. It kept retrying (no hard fail, not stuck on '/') but was far too slow.
+- 1.0.2: `_wait_open` first polls with a raw GET through `ctx.request` (browser cookies plus the real UA) every
+  `HIDDEN_POLL_MS`=400. While the body is the stub, it never touches the tab. Once the body is anything else,
+  it falls through to the original goto + NetFunnel + `_JS_PAGE_STATE` loop. `OPEN_WAIT_MAX_SECONDS` went from 600 to 900.
+  The preload logs that the page is hidden. The GUI shows the title "아직 비공개 상품 ...". The selftest accepts hidden
+  rows and proves the parser on control 10254531 when every drop row is hidden (otherwise CI fails today).
+- 1.0.2 live run: about 21 raw checks in 25 s, detected 1 s after un-hide, carted 14 s later (slow through the SOCKS
+  tunnel), test item removed, Artifacts upload 200 matched=True. CI run 36794432008, zip sha256 d401b491...
+- Open question: whether NetFunnel fronts the raw GET at open. If NetFunnel serves its own page, the body is no
+  longer the stub, so we fall through to the NetFunnel-aware tab loop, which is the safe direction.
