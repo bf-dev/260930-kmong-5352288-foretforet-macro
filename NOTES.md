@@ -171,3 +171,49 @@ until the deadline and read `basket_responses[-1]`, so with many tabs one produc
   `_download` passes MIN_ZIP_BYTES, sha matches. Artifacts: CI selftest v1.0.4 row and engineer
   verification row (matched=true), devnote posted.
 - Note: urllib default UA gets 403 from static.neoworks.us (Cloudflare); `requests` and curl are fine.
+
+## 2026-10-02 17:00 취소분 drop carted 0/10 -> 1.0.5
+
+Root cause of 0/10 (1.0.4): after the drop the product page showed the soldout_area, which 1.0.4
+read as "not open" and reloaded; on registered SOLDOUT options it still selected them, the site
+alerted, no amount input appeared, and the 3 s wait was retried 3x per row; unregistered sizes
+ended as "담을 옵션 없음". At 17:00 every registered target option was SOLDOUT or absent; the only
+stock was the unregistered CBW,4_5Y (SALE, stock 1) on 10279535. 10 tabs were not the cause.
+
+1.0.5 behavior (customer-confirmed spec):
+- All rows open in parallel; each row is checked ONCE after open. Sold out after open is final.
+  Missing size = instant skip ("옵션 없음, 바로 건너뜀"). Only "not open yet" retries.
+- One cart try per row (`send_multi` once, wait for its own basket.action reply), no reload.
+- Checkout in groups of `결제 묶음` (default 3, UI setting) finished attempts; a group with 0 carted
+  is skipped; last group may be smaller. `checkout_group(k, group, page, click)`.
+- Per-row checkbox "재고 있는 옵션 전부 담기" (`all_stock` in the saved row). ON: every cartable
+  option at row qty, capped by the site's per-option max_amount / stock, one pass. OFF: 1.0.4 manual.
+- Checkbox ON + page does not exist -> "상품 없음", no retry, counts as a finished attempt.
+  Checkbox OFF keeps retrying (official open hides pages as "존재하지 않는 상품" until open).
+  Live detection: `branduid=99999999` returns HTTP 200, 111-byte stub with
+  `alert('존재하지 않는 상품입니다.')` + redirect to "/"; a bad path is HTTP 404 Makeshop 403page.
+  Fixtures: tests/fixtures/n_notexist_stub.html, n_makeshop404.html.
+- Product tabs block images/fonts/media and trackers.
+
+Gotchas found live (2026-10-02, guest run through the KR tunnel):
+- **Blocking daumcdn kp.js breaks carting.** The site's `send_multi` (/js/jquery.multi_option.js)
+  calls `insert_kakao_pixel_basket()` -> `kakaoPixel(id).addToCart()` unguarded BEFORE
+  `common_basket_send`; with kakaoPixel undefined it throws and nothing is carted. Fix:
+  `TRACKER_STUBS` init script (Proxy no-op for kakaoPixel, fbq, Kakao, ChannelIO) on product tabs.
+  The STUB in tests/test_drop_flow.py calls kakaoPixel too, so the regression is covered.
+- **Guest cart cookie.** Only basket.html sets the guest `tempid` cookie (product pages and the
+  home page do not). Without it, parallel basket.action posts can each open their own guest
+  cart. purchase() now loads BASKET_URL on the main page before firing when not logged in.
+- Guest checkout: multi_order without login lands on /shop/qmember.html; engine jumps to
+  /shop/order.html?type=guest. 10254531 is 회원전용 (member-only): the guest order is refused
+  with an alert, engine logs it and stops that batch instead of looping.
+
+Live evidence method (do NOT use the customer account, never pay): a guest-only script
+(kept outside the repo in ~/workspace/kmong/tmp/ff105/live_run.py, disposable) builds an
+Engine with fixed rows, routes Playwright through `ssh -D 18765 unicorn@external-2`, runs
+`fire_all(batch=3, on_batch=checkout_group(click=False))`, reads the basket, compares each row's
+basket.action result with actual basket rows, then `remove_from_cart` to empty it.
+In-stock test products used on 2026-10-02: 10254531 (RLL sizes, member-only), 10275092 (20D,10Y).
+
+1.0.5 release: commit 610c3b7, CI run 36993873871 (tests, PE, Defender, selftest, gui.png all green),
+zip sha256 14cde837c25478742c22062e39ca49090e488504553794cf691d803ca51a5205, manifest bumped 2026-10-02.
