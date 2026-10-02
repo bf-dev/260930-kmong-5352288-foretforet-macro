@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 APP_SLUG = "foretforet-macro"
 APP_TITLE = "포레포레 오픈 구매 매크로"
 CUSTOMER_ID = "5352288"
@@ -41,6 +41,11 @@ HIDDEN_POLL_MS = 400           # re-check interval while the product page is the
 PRE_FIRE_RELOAD_MS = 150       # reload this many ms after open time on the server clock
 # 1.0.4: after the open, a product still hidden / sold-out-caution this long is skipped
 SOLDOUT_GRACE_SECONDS = 30
+# 1.0.5: check out after every N finished product rows (customer: 3 to 4 is fine)
+CHECKOUT_BATCH_DEFAULT = 3
+CHECKOUT_BATCH_MAX = 5
+# 1.0.5: product-page load budget at fire time. NetFunnel waiting does not count.
+FIRE_GOTO_TIMEOUT_MS = 30000
 
 
 def is_frozen() -> bool:
@@ -78,6 +83,7 @@ def default_settings() -> dict:
         "login_id": "",
         "pay_method": "KAKAOPAY", "auto_pay_click": True,
         "remember_id": True,
+        "checkout_batch": 3,
     }
 
 
@@ -95,6 +101,7 @@ def load_settings() -> dict:
         pass
     s.pop("login_pw", None)
     s["rows"] = normalize_rows(s.get("rows"))
+    s["checkout_batch"] = checkout_batch(s)
     return s
 
 
@@ -106,8 +113,9 @@ def _to_qty(v) -> int:
 
 
 def normalize_rows(rows) -> list[dict]:
-    """Coerce saved rows into {url, option, qty, enabled}. Old files without
-    'enabled' load as enabled; qty is an int in 0..99."""
+    """Coerce saved rows into {url, option, qty, enabled, all_stock}. Old files
+    without 'enabled' load as enabled, without 'all_stock' as unchecked; qty is
+    an int in 0..99."""
     out: list[dict] = []
     if not isinstance(rows, list):
         return [dict(r) for r in DEFAULT_ROWS]
@@ -119,8 +127,17 @@ def normalize_rows(rows) -> list[dict]:
             "option": str(r.get("option") or "").strip(),
             "qty": _to_qty(r.get("qty", 1)),
             "enabled": bool(r.get("enabled", True)),
+            "all_stock": bool(r.get("all_stock", False)),
         })
     return out
+
+
+def checkout_batch(s: dict) -> int:
+    try:
+        n = int(s.get("checkout_batch", CHECKOUT_BATCH_DEFAULT))
+    except Exception:
+        n = CHECKOUT_BATCH_DEFAULT
+    return max(1, min(CHECKOUT_BATCH_MAX, n))
 
 
 def active_rows(rows) -> list[dict]:

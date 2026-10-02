@@ -7,11 +7,16 @@ Flow for one run:
      2FA or a captcha by hand in the visible window
   3. preload every product page, resolve each row's option on the live page
   4. sync to the server clock (HTTP Date header) and wait for the open second
-  5. reload all product pages at once; while the product is still closed poll
-     lightly; while a NetFunnel queue popup is up never reload, just log the count
-  6. per product: select every wanted option, set its quantity, send_multi()
-  7. basket: tick only the items this run added, order them; a sold-out item is
-     dropped and a short-stock item is cut to what is left, then order again
+  5. load all product pages at once (images/fonts/trackers blocked); while the
+     product is still closed poll it with a light raw GET; while a NetFunnel queue
+     popup is up or the server is slow never reload, just wait
+  6. per product, exactly once on the open page: pick the wanted options (or, with
+     "재고 있는 옵션 전부 담기", every option in stock), skip sold-out / missing
+     ones, set the quantities and send_multi() once. A sold-out page, a missing
+     option or (checkbox rows) a page that does not exist is final, no retry
+  7. every N finished products (결제 묶음, default 3): basket -> tick only that
+     group's items -> order.html; a sold-out item is dropped and a short-stock item
+     is cut to what is left, then order again. A group with nothing carted is skipped
   8. order.html: KakaoPay + every required consent in one pass, press 결제하기 so
      the KakaoPay QR / approval window opens
 
@@ -36,6 +41,7 @@ KST = timezone(timedelta(hours=9))
 BASE = config.BASE_URL
 LOGIN_URL = BASE + "/shop/member.html?type=login"
 BASKET_URL = BASE + "/shop/basket.html"
+GUEST_ORDER_URL = BASE + "/shop/order.html?type=guest"
 MYPAGE_URL = BASE + "/shop/mypage.html"
 LOGIN_WAIT_SECONDS = 240       # time the customer has to finish 2FA / captcha by hand
 
@@ -49,16 +55,104 @@ _JS_NETFUNNEL = """() => {
           left: g('NetFunnel_Loading_Popup_TimeLeft')};
 }"""
 
-_JS_PAGE_STATE = """() => {
+# window.__ffStale is set on the old document right before a navigation, so a
+# slow load is never mistaken for the previous page's state.
+# Resolves (non-null) once the freshly loaded product page says what it is.
+_JS_DECISIVE = """(bu) => {
+  if (window.__ffStale) return null;
+  const nf = document.getElementById('NetFunnel_Loading_Popup');
+  if (nf) { const s = getComputedStyle(nf); if (s.display !== 'none' && s.visibility !== 'hidden') return null; }
   const top = document.querySelector('.shopdetailButtonTop');
-  const html = top ? top.innerHTML : '';
-  return {
-    hasSelect: !!document.querySelector('select[name="optionlist[]"]'),
-    caution: html.indexOf('product_caution') >= 0,
-    cartBtn: html.indexOf('send_multi(') >= 0,
-    sendMulti: typeof window.send_multi === 'function',
-  };
+  if (top) {
+    const h = top.innerHTML;
+    if (h.indexOf('soldout_area') >= 0) return 'soldout';
+    if (h.indexOf('product_caution') >= 0) return 'caution';
+    if (h.indexOf('send_multi(') >= 0 && typeof window.send_multi === 'function'
+        && typeof window.change_option === 'function'
+        && (document.querySelector('select[name="optionlist[]"]') || document.readyState !== 'loading'))
+      return 'open';
+    return document.readyState === 'complete' ? 'blank' : null;
+  }
+  const href = location.href;
+  if (href.indexOf('http') === 0 && href.indexOf('branduid=' + bu) < 0) return 'gone';
+  if (/403 forbidden/i.test(document.title || '')) return 'gone';
+  if (document.body && (document.body.textContent || '').indexOf('페이지가 존재하지') >= 0) return 'gone';
+  if (document.readyState !== 'loading') return 'blank';
+  return null;
 }"""
+
+# Site per-option quantity cap (multi_option.js set_amount clamps each option row to it).
+_JS_MAX_AMOUNT = """() => {
+  try {
+    const m = (window.option_manager && option_manager.info && option_manager.info.max_amount)
+      || parseInt(window.max_amount, 10);
+    return parseInt(m, 10) || 0;
+  } catch (e) { return 0; }
+}"""
+
+# All picks in one round trip: select the option exactly like a click would (the
+# select's own onchange -> change_option), take the amount input it created, set
+# the quantity through the shop's set_amount (which applies the cap) and read back
+# what the shop accepted. Sold-out options are never passed in here.
+_JS_PICK = """(picks) => {
+  const sel = document.querySelector('select[name="optionlist[]"]');
+  const out = [];
+  if (!sel) return out;
+  const ids = () => new Set(Array.from(document.querySelectorAll('[id^="MS_amount_basic_"]')).map(e => e.id));
+  for (const [val, q] of picks) {
+    const before = ids();
+    let err = '';
+    try {
+      sel.value = val;
+      sel.dispatchEvent(new Event('change', {bubbles: true}));
+    } catch (e) { err = String(e && e.message || e).slice(0, 120); }
+    const added = Array.from(document.querySelectorAll('[id^="MS_amount_basic_"]')).filter(e => !before.has(e.id));
+    const inp = added.length ? added[added.length - 1] : null;
+    let got = 0;
+    if (inp) {
+      if (q !== 1) {
+        inp.value = String(q);
+        try { if (typeof set_amount === 'function') set_amount(inp, 'basic'); }
+        catch (e) { err = String(e && e.message || e).slice(0, 120); }
+      }
+      got = parseInt(inp.value, 10) || 0;
+    }
+    out.push({val, ok: !!inp, id: inp ? inp.id : '', qty: got, err});
+  }
+  return out;
+}"""
+
+# Product tabs only: drop what the cart never needs. NetFunnel, jQuery and the
+# shop's own scripts (foretforet.com, makeshop CDN, jsdelivr) always load.
+BLOCK_TYPES = {"image", "font", "media"}
+BLOCK_HOSTS = ("datarize", "bzrcdn", "openai", "channel.io", "snapfit", "facebook", "criteo",
+               "cdnfonts", "doubleclick", "googletagmanager", "google-analytics", "the-relay.kr",
+               "mk-log.makeshop.co.kr", "clarity.ms", "wcs.naver.net", "daumcdn", "pf.kakao.com",
+               "developers.kakao.com", "ftc.go.kr")
+
+
+# Chainable no-op for every tracker global the product page calls while its
+# script is blocked: kakaoPixel('id').addToCart({...}), kakaoPixel.setServiceOrigin(..),
+# fbq('track', ..), Kakao.init(..), ChannelIO('boot', ..).
+TRACKER_STUBS = """(() => {
+  const noop = () => new Proxy(function () {}, {
+    get: (t, k) => (typeof k === 'symbol' || k === 'then' || k === 'toJSON') ? undefined : noop(),
+    apply: () => noop(),
+    set: () => true,
+  });
+  for (const k of ['kakaoPixel', 'fbq', 'Kakao', 'ChannelIO']) {
+    if (typeof window[k] === 'undefined') window[k] = noop();
+  }
+})();"""
+
+
+def blocked(resource_type: str, url: str) -> bool:
+    if "netfunnel" in url.lower():
+        return False
+    if resource_type in BLOCK_TYPES:
+        return True
+    host = re.sub(r"^[a-z]+://([^/:]+).*$", r"\1", url.lower())
+    return any(h in host for h in BLOCK_HOSTS)
 
 _JS_BASKET = """() => Array.from(document.querySelectorAll('input[name="basketchks"]')).map((c, i) => {
   const items = document.getElementsByName('basket_item');
@@ -105,6 +199,7 @@ class Want:
     qty: int
     option: parser.Option | None = None
     note: str = ""
+    all_stock: bool = False
 
 
 @dataclass
@@ -117,6 +212,18 @@ class Product:
     cart_ids: list[str] = field(default_factory=list)
     message: str = ""
     dropped: bool = False
+    gone: bool = False           # page does not exist (checkbox rows: final)
+    t_fire: float = 0.0
+    t_open: float = 0.0
+    t_cart: float = 0.0
+    picked: list = field(default_factory=list)   # [(option text, qty)] sent to the cart
+    deadline: float = 0.0
+    drop_at: float = 0.0
+
+    @property
+    def all_stock(self) -> bool:
+        """Row checkbox "재고 있는 옵션 전부 담기" (any row of this product)."""
+        return any(w.all_stock for w in self.wants)
 
 
 def group_rows(rows: list[dict]) -> list[Product]:
@@ -128,8 +235,28 @@ def group_rows(rows: list[dict]) -> list[Product]:
         bu = parser.branduid_of(r["url"])
         if not bu:
             continue
-        products.setdefault(bu, Product(bu)).wants.append(Want(i, bu, r["option"], r["qty"]))
+        products.setdefault(bu, Product(bu)).wants.append(
+            Want(i, bu, r["option"], r["qty"], all_stock=r["all_stock"]))
     return list(products.values())
+
+
+async def _quiet(coro) -> None:
+    """Await a fire-and-forget call on a tab that may already be closed."""
+    try:
+        await coro
+    except Exception:
+        pass
+
+
+def cap_qty(qty: int, cap: int | None, opt: parser.Option) -> int:
+    """Quantity for one option: the row quantity, cut to the site's per-option cap
+    and to the known stock."""
+    n = max(1, int(qty))
+    if cap and cap > 0:
+        n = min(n, cap)
+    if opt.stock is not None and not opt.unlimited and opt.stock > 0:
+        n = min(n, opt.stock)
+    return max(1, n)
 
 
 class Engine:
@@ -151,6 +278,8 @@ class Engine:
         self.browser_label = ""
         self.basket_responses: list[dict] = []
         self.dialogs: list[str] = []
+        self._last_status: dict[str, int] = {}
+        self._page_dialogs: dict[int, list[str]] = {}
 
     # ------------------------------------------------------------------ util
     def log(self, msg: str) -> None:
@@ -199,12 +328,13 @@ class Engine:
         def on_dialog(d):
             msg = d.message or ""
             self.dialogs.append(msg)
+            self._page_dialogs.setdefault(id(page), []).append(msg)
             self.log(f"사이트 알림: {msg.strip()[:120]}")
             # "담겼습니다. 지금 확인하시겠습니까?" -> stay on the product page
             if d.type == "confirm" and "장바구니에 담겼습니다" in msg:
-                asyncio.ensure_future(d.dismiss())
+                asyncio.ensure_future(_quiet(d.dismiss()))
             else:
-                asyncio.ensure_future(d.accept())
+                asyncio.ensure_future(_quiet(d.accept()))
 
         async def on_response(resp):
             if "basket.action" not in resp.url:
@@ -224,11 +354,30 @@ class Engine:
                 pass
 
         page.on("dialog", on_dialog)
-        page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+        page.on("response", lambda r: asyncio.ensure_future(_quiet(on_response(r)))
+                if "basket.action" in r.url else None)
 
-    async def _new_page(self):
+    async def _new_page(self, product: bool = False):
+        """product=True: a product tab, heavy resources and trackers are aborted."""
         page = await self.ctx.new_page()
         self._attach(page)
+        if product:
+            async def light(route):
+                try:
+                    req = route.request
+                    if blocked(req.resource_type, req.url):
+                        await route.abort()
+                    else:
+                        await route.fallback()
+                except Exception:
+                    pass
+            await page.route("**/*", light)
+            # Blocking the tracker scripts leaves their globals undefined, and the
+            # shop's send_multi calls insert_kakao_pixel_basket() -> kakaoPixel(..)
+            # .addToCart() unguarded before common_basket_send: a ReferenceError
+            # there means nothing is carted (seen live 2026-10-02). Define no-op
+            # stand-ins before any page script runs.
+            await page.add_init_script(TRACKER_STUBS)
         return page
 
     async def _snapshot(self, page, label: str) -> None:
@@ -365,7 +514,7 @@ class Engine:
         before the third-party tags finish (1.0.2 lost 30 s per product on that
         TimeoutError). Return as soon as the option select and send_multi exist."""
         try:
-            await prod.page.goto(parser.product_url(prod.branduid), wait_until="commit", timeout=10000)
+            await prod.page.goto(parser.product_url(prod.branduid), wait_until="commit", timeout=config.FIRE_GOTO_TIMEOUT_MS)
         except Exception as exc:
             if "Timeout" not in type(exc).__name__:
                 raise
@@ -394,15 +543,32 @@ class Engine:
         return True
 
     async def _fetch_product(self, prod: Product) -> bytes | None:
-        """Raw GET of the product page with the browser's cookies; None on any error."""
+        """Raw GET of the product page with the browser's cookies; None on any error.
+        The HTTP status is kept in self._last_status for the not-exist check."""
         try:
             if not getattr(self, "_ua", None):
                 self._ua = await prod.page.evaluate("navigator.userAgent")
             r = await self.ctx.request.get(parser.product_url(prod.branduid), timeout=10000,
                                            headers={"User-Agent": self._ua})
+            self._last_status[prod.branduid] = r.status
             return await r.body()
         except Exception:
             return None
+
+    def _raw_state(self, prod: Product, body: bytes | None) -> str:
+        """What a raw GET body says: gone | soldout | caution | load (open or unclear,
+        let the browser tab load it)."""
+        if body is None:
+            return "load"
+        if parser.is_not_exist(body, self._last_status.get(prod.branduid)):
+            return "gone"
+        text = body.decode("utf-8", "replace")
+        if parser.is_soldout_page(text):
+            return "soldout"
+        btn = re.search(r'class="shopdetailButtonTop"(.*?)</div>', text, re.S)
+        if btn and "product_caution" in btn.group(1):
+            return "caution"
+        return "load"
 
     def _drop(self, prod: Product) -> bool:
         prod.dropped = True
@@ -411,128 +577,281 @@ class Engine:
                  f"(오픈 {config.SOLDOUT_GRACE_SECONDS}초 후에도 판매 전/품절 화면, 나머지 상품으로 결제 진행)")
         return False
 
-    async def _wait_open(self, prod: Product, deadline: float, drop_at: float | None = None) -> bool:
-        """Reload until the cart button shows. Never reload under a NetFunnel popup.
-
-        While the shop hides the product (the page body is only the
-        "존재하지 않는 상품입니다" alert + redirect to '/'), poll it with a raw GET every
-        HIDDEN_POLL_MS instead of navigating the tab, so the alert/redirect never
-        costs a page load. As soon as the body is anything else, fall through to the
-        real page load (NetFunnel aware) below.
-
-        drop_at (1.0.4): after the open, a product still hidden or showing the
-        sold-out/stopped caution past drop_at is given up so checkout is not held
-        hostage by it. Time spent in a NetFunnel queue pushes drop_at back.
-        """
-        page = prod.page
-        last_nf: list = []
-        polls = 0
-        hidden = 0
-        while not self.stopped():
-            body = await self._fetch_product(prod)
-            if body is not None and parser.is_hidden_stub(body):
-                hidden += 1
-                if hidden == 1:
-                    self.diag.add_response("GET", parser.product_url(prod.branduid), 200,
-                                           body.decode("utf-8", "replace"))
-                if hidden == 1 or hidden % 150 == 0:
-                    self.log(f"[{prod.branduid}] 상품 페이지 아직 비공개(존재하지 않는 상품), "
-                             f"계속 다시 확인 중 ({hidden}회)")
-                if time.time() > deadline:
-                    self.log(f"[{prod.branduid}] 오픈 대기 시간 초과 (상품 비공개 상태)")
-                    return False
-                if drop_at is not None and time.time() > drop_at:
-                    return self._drop(prod)
-                await asyncio.sleep(config.HIDDEN_POLL_MS / 1000.0)
-                continue
-            if hidden:
-                self.log(f"[{prod.branduid}] 상품 페이지 공개됨 ({hidden}회 확인 후), 바로 엽니다")
-                hidden = 0
-            try:
-                await self._goto_product(prod)
-                queued = False
-                while not self.stopped() and await self._netfunnel(page, prod.branduid, last_nf):
-                    queued = True
-                    await asyncio.sleep(0.5)
-                if queued and drop_at is not None:
-                    drop_at = max(drop_at, time.time() + config.SOLDOUT_GRACE_SECONDS)
-                st = await page.evaluate(_JS_PAGE_STATE)
-                if st.get("hasSelect") and st.get("cartBtn") and not st.get("caution"):
-                    return True
-                if st.get("caution") and drop_at is not None and time.time() > drop_at:
-                    return self._drop(prod)
-                polls += 1
-                if polls == 1 or polls % 20 == 0:
-                    self.log(f"[{prod.branduid}] 아직 판매 전 화면, 다시 확인 중 ({polls}회)")
-            except Exception as exc:
-                self.log(f"[{prod.branduid}] 페이지 확인 재시도: {type(exc).__name__}")
-            if time.time() > deadline:
-                self.log(f"[{prod.branduid}] 오픈 대기 시간 초과")
-                return False
-            await asyncio.sleep(config.OPEN_POLL_MS / 1000.0)
+    def _soldout(self, prod: Product) -> bool:
+        prod.dropped = True
+        prod.message = "품절"
+        self.log(f"품절: {prod.title or prod.branduid} [{prod.branduid}] (오픈된 페이지가 품절, 다시 시도하지 않음)")
         return False
 
-    async def _add_to_cart(self, prod: Product) -> None:
-        page = prod.page
-        html = await page.content()
-        opts = parser.parse_options(html)
-        picks: list[Want] = []
+    def _gone(self, prod: Product) -> bool:
+        """Checkbox rows: the shop says the page does not exist -> final, no retry."""
+        prod.dropped = True
+        prod.gone = True
+        prod.message = "상품 없음"
+        self.log(f"상품 없음: {prod.title or prod.branduid} [{prod.branduid}] (페이지 없음, 바로 건너뜀)")
+        return False
+
+    def _dialogs_since(self, page, mark: int, needle: str) -> bool:
+        return any(needle in m for m in self._page_dialogs.get(id(page), [])[mark:])
+
+    async def _load(self, prod: Product) -> str:
+        """Navigate the tab to the product once and wait until the page says what it
+        is: open | soldout | caution | gone | unknown | stopped.
+
+        Never reloads by itself: a NetFunnel queue is waited out (queue time does not
+        count against the deadlines) and a slow server gets FIRE_GOTO_TIMEOUT_MS of
+        silence before this gives up and lets the caller load again."""
+        page, bu = prod.page, prod.branduid
+        mark = len(self._page_dialogs.get(id(page), []))
+        try:
+            await page.evaluate("() => { window.__ffStale = true; }")
+        except Exception:
+            pass
+        status = None
+        try:
+            resp = await page.goto(parser.product_url(bu), wait_until="commit",
+                                   timeout=config.FIRE_GOTO_TIMEOUT_MS)
+            status = resp.status if resp else None
+        except Exception as exc:
+            if "Timeout" not in type(exc).__name__:
+                raise
+            self.log(f"[{bu}] 서버 응답이 느립니다, 새로고침하지 않고 계속 기다립니다")
+        if status == 404:
+            return "gone"
+        last_nf: list = []
+        t_quiet = t_prev = time.time()
+        blank_since = 0.0
+        while not self.stopped():
+            kind = None
+            try:
+                h = await page.wait_for_function(_JS_DECISIVE, arg=bu, timeout=700, polling=40)
+                kind = await h.json_value()
+            except Exception:
+                kind = None
+            now = time.time()
+            if self._dialogs_since(page, mark, "존재하지 않는"):
+                return "gone"
+            if kind in ("open", "soldout", "caution", "gone"):
+                return kind
+            if await self._netfunnel(page, bu, last_nf):
+                # queued: never reload, and the wait is not counted against any deadline
+                spent = now - t_prev
+                prod.deadline += spent
+                if prod.drop_at:
+                    prod.drop_at += spent
+                t_quiet = now
+            elif kind == "blank":
+                # loaded, no product markup: the hidden-product alert stub before its
+                # redirect, or an error page. Give the alert/redirect a moment.
+                blank_since = blank_since or now
+                if now - blank_since > 2.0:
+                    return "unknown"
+            elif now - t_quiet > config.FIRE_GOTO_TIMEOUT_MS / 1000.0:
+                return "unknown"
+            if now > prod.deadline:
+                return "unknown"
+            t_prev = now
+        return "stopped"
+
+    async def _poll_raw(self, prod: Product, why: str) -> str:
+        """While the shop hides the product (alert stub) or shows the not-yet-open
+        caution, poll it with a light raw GET instead of reloading the tab. Returns
+        the new raw state (load | soldout | gone | caution) or timeout | drop | stopped."""
+        n = 0
+        cur = why
+        while not self.stopped():
+            if time.time() > prod.deadline:
+                return "timeout"
+            if cur == "caution" and prod.all_stock and time.time() > prod.drop_at:
+                return "drop"
+            await asyncio.sleep((config.HIDDEN_POLL_MS if cur == "gone" else config.OPEN_POLL_MS) / 1000.0)
+            body = await self._fetch_product(prod)
+            st = self._raw_state(prod, body)
+            n += 1
+            if st == "gone":
+                if n == 1:
+                    self.diag.add_response("GET", parser.product_url(prod.branduid),
+                                           self._last_status.get(prod.branduid) or 200,
+                                           (body or b"").decode("utf-8", "replace"))
+                if prod.all_stock:
+                    return "gone"
+                if n == 1 or n % 150 == 0:
+                    self.log(f"[{prod.branduid}] 상품 페이지 아직 비공개(존재하지 않는 상품), "
+                             f"계속 다시 확인 중 ({n}회)")
+            elif st == "caution":
+                if n == 1 or n % 20 == 0:
+                    self.log(f"[{prod.branduid}] 아직 판매 전 화면, 다시 확인 중 ({n}회)")
+            else:
+                if cur == "gone" and st == "load":
+                    self.log(f"[{prod.branduid}] 상품 페이지 공개됨 ({n}회 확인 후), 바로 엽니다")
+                return st
+            cur = st
+        return "stopped"
+
+    async def _wait_open(self, prod: Product) -> bool:
+        """Get the tab onto the open product page. Only waiting for the open retries
+        (NetFunnel, hidden page, not-yet-open caution, a slow or broken load). Once
+        the shop answers, these are final and never retried:
+          - sold-out page (soldout_area)                     -> 품절
+          - page does not exist, checkbox rows only          -> 상품 없음
+          - caution past the grace period, checkbox rows only -> 품절 상태로 건너뜀
+        Rows without the checkbox (the official open) keep waiting on a hidden or
+        caution page until OPEN_WAIT_MAX_SECONDS."""
+        bu = prod.branduid
+        loads = 0
+        while not self.stopped():
+            if time.time() > prod.deadline:
+                self.log(f"[{bu}] 오픈 대기 시간 초과")
+                return False
+            try:
+                kind = await self._load(prod)
+            except Exception as exc:
+                self.log(f"[{bu}] 페이지 확인 재시도: {type(exc).__name__}")
+                kind = "unknown"
+            loads += 1
+            if kind == "open":
+                prod.t_open = time.time()
+                return True
+            if kind == "soldout":
+                return self._soldout(prod)
+            if kind == "stopped":
+                return False
+            if kind == "unknown":
+                if loads == 1 or loads % 10 == 0:
+                    self.log(f"[{bu}] 페이지가 아직 제대로 안 열렸습니다, 다시 엽니다 ({loads}회)")
+                await asyncio.sleep(config.OPEN_POLL_MS / 1000.0)
+                continue
+            if kind == "gone":
+                if prod.all_stock:
+                    return self._gone(prod)
+                try:
+                    await prod.page.evaluate("() => window.stop()")   # no home-page load behind the alert
+                except Exception:
+                    pass
+            if kind == "caution" and prod.all_stock and time.time() > prod.drop_at:
+                return self._drop(prod)
+            raw = await self._poll_raw(prod, kind)
+            if raw == "soldout":
+                return self._soldout(prod)
+            if raw == "gone":
+                return self._gone(prod)
+            if raw == "drop":
+                return self._drop(prod)
+            if raw == "timeout":
+                self.log(f"[{bu}] 오픈 대기 시간 초과")
+                return False
+            if raw == "stopped":
+                return False
+        return False
+
+    def _plan(self, prod: Product, opts: list, cap: int | None) -> list[tuple[parser.Option, int, str]]:
+        """(option, qty, label) to cart. Manual rows: the typed option as in 1.0.4, but a
+        missing or sold-out option is skipped at once. Checkbox rows: every option the
+        shop still sells, each with the row quantity. Quantities are cut to the
+        site's per-option cap and to the known stock."""
+        want: dict[str, list] = {}
+        order: list[str] = []
+
+        def put(o: parser.Option, q: int, label: str) -> None:
+            if o.value not in want:
+                want[o.value] = [o, 0, label]
+                order.append(o.value)
+            want[o.value][1] = max(want[o.value][1], q) if label == "all" else want[o.value][1] + q
+
+        stock_rows = [w for w in prod.wants if w.all_stock]
+        if stock_rows:
+            q = max(w.qty for w in stock_rows)
+            buy = [o for o in opts if o.buyable]
+            rows = ", ".join(str(w.row_no) for w in stock_rows)
+            self.log(f"[{rows}번] 재고 있는 옵션 전부 담기: 구매 가능 {len(buy)}/{len(opts)}개 "
+                     f"({', '.join(o.text for o in buy) or '없음'})")
+            for o in buy:
+                put(o, q, "all")
         for w in prod.wants:
+            if w.all_stock:
+                continue
             opt, note = parser.match_option(w.wanted, opts)
             w.option, w.note = opt, note
             if not opt:
-                self.log(f"[{w.row_no}번] 옵션 못 찾음: {note}")
+                self.log(f"[{w.row_no}번] 옵션 없음, 바로 건너뜀: {note}")
                 continue
             if not opt.buyable:
-                self.log(f"[{w.row_no}번] {opt.text} 구매 불가 ({opt.state}, 재고 {opt.stock}), 그래도 시도")
-            picks.append(w)
-        if not picks:
-            prod.message = "담을 옵션 없음"
+                self.log(f"[{w.row_no}번] {opt.text} 품절 ({opt.state}, 재고 {opt.stock}), 건너뜀")
+                continue
+            put(opt, w.qty, "row")
+        out = []
+        for v in order:
+            o, q, label = want[v]
+            n = cap_qty(q, cap, o)
+            if n < q:
+                self.log(f"[{prod.branduid}] {o.text} 수량 {q} -> {n} (사이트 최대 {cap or '-'}, 재고 {o.stock})")
+            out.append((o, n, label))
+        return out
+
+    async def _add_to_cart(self, prod: Product) -> None:
+        """Exactly one cart try on the open page: read the options once, pick them all
+        in one evaluate, send_multi() once, read this tab's own basket.action reply."""
+        page = prod.page
+        html = await page.content()
+        opts = parser.parse_options(html)
+        try:
+            cap = int(await page.evaluate(_JS_MAX_AMOUNT)) or None
+        except Exception:
+            cap = parser.parse_max_amount(html)
+        plan = self._plan(prod, opts, cap)
+        if not plan:
+            prod.message = "담을 옵션 없음 (품절/옵션 없음)"
+            self.log(f"[{prod.branduid}] 담을 옵션 없음, 바로 다음으로")
             return
-        sel = page.locator('select[name="optionlist[]"]').first
-        for idx, w in enumerate(picks):
-            await sel.select_option(w.option.value)
-            await page.wait_for_selector(f"#MS_amount_basic_{idx}", state="attached", timeout=3000)
-            if w.qty != 1:
-                await page.evaluate(
-                    "([i, q]) => { const e = document.getElementById('MS_amount_basic_' + i);"
-                    " e.value = String(q); if (typeof set_amount === 'function') set_amount(e, 'basic'); }",
-                    [idx, w.qty])
+        res = await page.evaluate(_JS_PICK, [[o.value, n] for o, n, _ in plan])
+        picked = []
+        for (o, n, _), r in zip(plan, res or []):
+            if r.get("ok"):
+                picked.append((o.text, int(r.get("qty") or n)))
+            else:
+                self.log(f"[{prod.branduid}] {o.text} 선택 안 됨 (사이트가 거절){': ' + r['err'] if r.get('err') else ''}")
+        if not picked:
+            prod.message = "담을 옵션 없음 (선택 거절)"
+            return
+        prod.picked = picked
         before = len(self.basket_responses)
 
         def mine() -> list[dict]:
             return [r for r in self.basket_responses[before:] if r.get("page") is page]
 
-        await page.evaluate("window._is_send_multi = false; send_multi('', '')")
-        t_end = time.time() + 8
+        await page.evaluate("() => { window._is_send_multi = false; send_multi('', ''); }")
+        # never resend: wait for this tab's own reply as long as the server needs
+        t_end = time.time() + config.FIRE_GOTO_TIMEOUT_MS / 1000.0
         last_nf: list = []
         while time.time() < t_end and not mine() and not self.stopped():
             if await self._netfunnel(page, prod.branduid, last_nf):
-                t_end = time.time() + 8   # queued: keep waiting, never resend
-            await asyncio.sleep(0.1)
+                t_end = time.time() + config.FIRE_GOTO_TIMEOUT_MS / 1000.0
+            await asyncio.sleep(0.03)
         own = mine()
         if not own:
             prod.message = "장바구니 응답 없음"
             self.log(f"[{prod.branduid}] 장바구니 응답이 없습니다")
             return
+        prod.t_cart = time.time()
         body = own[0]["body"]
         try:
             data = json.loads(body)
         except Exception:
             data = {}
+        names = ", ".join(f"{t} x{q}" for t, q in picked)
         if data.get("status") is True:
             prod.added = True
             arr = ((data.get("etc_data") or {}).get("basket_uid_array")) or []
             prod.cart_ids = [str(x) for x in arr]
-            names = ", ".join(f"{w.option.text} x{w.qty}" for w in picks)
-            self.log(f"[{prod.branduid}] 장바구니 담기 성공: {names}")
+            self.log(f"[{prod.branduid}] 장바구니 담기 성공: {names} "
+                     f"(오픈→담기 {prod.t_cart - prod.t_open:.2f}초)")
         else:
             prod.message = str(data.get("message") or body[:200])
             self.log(f"[{prod.branduid}] 장바구니 담기 실패: {prod.message}")
 
-    async def _fire_product(self, prod: Product, deadline: float, drop_at: float | None = None) -> None:
+    async def _fire_product(self, prod: Product) -> None:
         try:
-            await self._fire_product_once(prod, deadline, drop_at)
+            await self._fire_product_once(prod)
         finally:
             await self._close_product_tab(prod)
 
@@ -550,24 +869,19 @@ class Engine:
         except Exception:
             pass
 
-    async def _fire_product_once(self, prod: Product, deadline: float, drop_at: float | None) -> None:
-        for attempt in range(3):
-            if self.stopped():
-                return
-            if not await self._wait_open(prod, deadline, drop_at):
-                prod.message = prod.message or "오픈되지 않음"
-                return
-            try:
-                await self._add_to_cart(prod)
-            except Exception as exc:
-                prod.message = f"{type(exc).__name__}: {exc}"
-                self.log(f"[{prod.branduid}] 담기 오류: {prod.message[:160]}")
-            if prod.added:
-                return
-            if "품절" in prod.message or "재고" in prod.message:
-                return
-            self.log(f"[{prod.branduid}] 다시 시도 ({attempt + 2}/3)")
-            await asyncio.sleep(0.2)
+    async def _fire_product_once(self, prod: Product) -> None:
+        """One attempt per product: wait for the open, then one cart try. No retry
+        after the shop has answered (sold out never comes back)."""
+        if self.stopped():
+            return
+        if not await self._wait_open(prod):
+            prod.message = prod.message or "오픈되지 않음"
+            return
+        try:
+            await self._add_to_cart(prod)
+        except Exception as exc:
+            prod.message = f"{type(exc).__name__}: {exc}"
+            self.log(f"[{prod.branduid}] 담기 오류: {prod.message[:160]}")
 
     # ---------------------------------------------------------------- basket
     async def read_basket(self, page) -> list[dict]:
@@ -641,12 +955,23 @@ class Engine:
                     self.log(f"기존 장바구니 상품 {others}개는 주문에서 제외 (그대로 둠)")
             mark = len(self.dialogs)
             await self._try_order(page)
+            if "qmember.html" in page.url:
+                # not logged in: the shop asks member-or-guest. Its own 비회원 구매
+                # button (MK_order_shoppay) goes to order.html?type=guest.
+                self.log("로그인 안 됨: 비회원 주문서로 이동")
+                try:
+                    await page.goto(GUEST_ORDER_URL, wait_until="domcontentloaded", timeout=15000)
+                except Exception as exc:
+                    self.log(f"비회원 주문서 이동 실패: {type(exc).__name__}")
             if "order.html" in page.url:
                 await self._snapshot(page, "order_page")
                 if exclude:
                     self.log(f"품절 {len(exclude)}개 제외하고 주문서로 이동")
                 return page.url
             alerts = self.dialogs[mark:]
+            if any("회원전용" in msg for msg in alerts):
+                self.log("회원전용 상품이 있어 비회원 주문 불가: 로그인 후 다시 시도해 주세요")
+                break
             found = [x for msg in alerts for x in parser.parse_stock_alerts(msg)]
             if not found:
                 blind += 1
@@ -817,27 +1142,99 @@ class Engine:
         except Exception:
             pass
 
-    async def fire_all(self, products: list[Product]) -> list[Product]:
-        """All product tabs at once. Returns the carted products; every product tab is
-        closed when this returns."""
+    async def fire_all(self, products: list[Product], batch: int | None = None,
+                       on_batch=None) -> list[Product]:
+        """All product tabs at once, one attempt each. Every `batch` finished products
+        (carted, sold out, missing option, 상품 없음 ...) are handed to on_batch(group)
+        while the others keep going; the last group may be smaller. Checkouts run one
+        after another in finishing order. Returns the carted products; every product
+        tab is closed when this returns."""
         t0 = time.time()
-        deadline = time.time() + config.OPEN_WAIT_MAX_SECONDS
-        # started late or on time, the sold-out grace runs from the moment we fire
-        drop_at = time.time() + config.SOLDOUT_GRACE_SECONDS
-        await asyncio.gather(*(self._fire_product(p, deadline, drop_at) for p in products),
-                             return_exceptions=True)
+        n = max(1, int(batch or config.CHECKOUT_BATCH_DEFAULT))
+        for p in products:
+            p.t_fire = t0
+            p.deadline = t0 + config.OPEN_WAIT_MAX_SECONDS
+            # started late or on time, the caution grace runs from the moment we fire
+            p.drop_at = t0 + config.SOLDOUT_GRACE_SECONDS
+        queue: asyncio.Queue = asyncio.Queue()
+        group: list[Product] = []
+        self.finish_order: list[str] = []
+
+        async def one(p: Product) -> None:
+            try:
+                await self._fire_product(p)
+            except Exception as exc:
+                p.message = p.message or f"{type(exc).__name__}: {exc}"
+            self.finish_order.append(p.branduid)
+            group.append(p)
+            if len(group) >= n:
+                queue.put_nowait(list(group))
+                group.clear()
+
+        async def checkout() -> None:
+            k = 0
+            while True:
+                g = await queue.get()
+                if g is None:
+                    return
+                k += 1
+                if on_batch is None:
+                    continue
+                try:
+                    await on_batch(k, g)
+                except Exception as exc:
+                    self.log(f"{k}번째 결제 묶음 오류: {type(exc).__name__}: {str(exc)[:120]}")
+
+        worker = asyncio.ensure_future(checkout())
+        await asyncio.gather(*(one(p) for p in products), return_exceptions=True)
+        if group:
+            queue.put_nowait(list(group))
+            group.clear()
+        queue.put_nowait(None)
         added = [p for p in products if p.added]
         self.log(f"담기 완료 {len(added)}/{len(products)}개 상품 ({time.time() - t0:.1f}초)")
         dropped = [p for p in products if p.dropped]
         if dropped:
-            self.log(f"품절로 건너뛴 상품 {len(dropped)}개: "
-                     + ", ".join(p.title or p.branduid for p in dropped))
+            self.log(f"건너뛴 상품 {len(dropped)}개: "
+                     + ", ".join(f"{p.title or p.branduid}({p.message})" for p in dropped))
         for p in products:
+            if p.t_cart and p.t_open:
+                self.log(f"  시간 {p.branduid}: 발사→오픈 {p.t_open - p.t_fire:.2f}초, "
+                         f"오픈→담기 {p.t_cart - p.t_open:.2f}초")
             if not p.added:
                 self.log(f"  실패 {p.branduid}: {p.message or '알 수 없음'}")
+        await worker
         for p in products:   # normally already closed by _fire_product
             await self._close_product_tab(p)
         return added
+
+    def timings(self, products: list[Product]) -> list[dict]:
+        return [{"branduid": p.branduid, "added": p.added, "message": p.message,
+                 "picked": [f"{t} x{q}" for t, q in p.picked],
+                 "fire_to_open": round(p.t_open - p.t_fire, 3) if p.t_open else None,
+                 "open_to_cart": round(p.t_cart - p.t_open, 3) if p.t_cart and p.t_open else None}
+                for p in products]
+
+    async def checkout_group(self, k: int, group: list[Product], page, click: bool) -> dict:
+        """One 결제 묶음: order only what this group carted (other basket rows stay
+        unticked), then KakaoPay + consents (+ 결제하기 when click)."""
+        names = [p.branduid for p in group]
+        carted = [p for p in group if p.added]
+        rec: dict = {"no": k, "products": names, "carted": [p.branduid for p in carted]}
+        if not carted:
+            self.log(f"{k}번째 결제 묶음 ({', '.join(names)}): 담긴 상품 없음, 결제 건너뜀")
+            rec["result"] = "skipped"
+            return rec
+        self.log(f"{k}번째 결제 묶음: {len(carted)}/{len(group)}개 상품 결제 진행 ({', '.join(rec['carted'])})")
+        url = await self.go_order(page, carted)
+        reached = "order.html" in url
+        rec["orderUrl"] = url
+        rec["result"] = "order-page" if reached else "basket-only"
+        self.log(f"{k}번째 결제 묶음 주문서 도착: {url}" if reached
+                 else f"{k}번째 결제 묶음: 주문서가 아닌 화면 {url}")
+        if reached:
+            rec["pay"] = await self.prepare_order(page, click=click)
+        return rec
 
     async def purchase(self, cleanup_after: bool = False, hold: bool = True) -> dict:
         from playwright.async_api import async_playwright
@@ -868,8 +1265,15 @@ class Engine:
             logged = await self.ensure_login(page)
             if not logged:
                 self.log("로그인 없이 진행하면 비회원 주문 화면으로 갑니다")
+                # Only basket.html issues the guest `tempid` cookie. Without it,
+                # parallel basket.action posts each open their own guest cart and
+                # one product's items vanish (seen live in a guest test run).
+                try:
+                    await page.goto(BASKET_URL, wait_until="domcontentloaded", timeout=15000)
+                except Exception as exc:
+                    self.log(f"장바구니 준비 실패: {type(exc).__name__}")
             for prod in products:
-                prod.page = await self._new_page()
+                prod.page = await self._new_page(product=True)
                 try:
                     await self._goto_product(prod)
                     await self._resolve(prod)
@@ -902,30 +1306,46 @@ class Engine:
             if self.stopped():
                 return await self._finish({"result": "stopped"})
             self.log("오픈! 상품 페이지 새로고침 및 담기 시작")
-            added = await self.fire_all(products)
-            if not added:
-                return await self._finish({"result": "nothing-added"}, hold=hold)
-            url = await self.go_order(page, products)
-            reached = "order.html" in url
-            self.log(f"주문서 도착: {url}" if reached else f"주문서가 아닌 화면: {url}")
-            result = {"result": "order-page" if reached else "basket-only", "orderUrl": url,
-                      "added": [p.branduid for p in added]}
-            if reached:
-                # one pass, no waiting: KakaoPay + consents + 결제하기 (tests never click)
-                click = bool(self.s.get("auto_pay_click", True)) and not cleanup_after
-                result["pay"] = await self.prepare_order(page, click=click)
+            n = config.checkout_batch(self.s)
+            click = bool(self.s.get("auto_pay_click", True)) and not cleanup_after
+            batches: list[dict] = []
+            order_pages: list = []
+
+            async def on_batch(k: int, group: list[Product]) -> None:
+                # first group pays on the main tab, every later group on its own tab
+                # so an open KakaoPay window is never navigated away
+                carted = any(p.added for p in group)
+                if carted and order_pages:
+                    pg = await self._new_page()
+                else:
+                    pg = page
+                rec = await self.checkout_group(k, group, pg, click)
+                if rec.get("result") != "skipped":
+                    order_pages.append(pg)
+                batches.append(rec)
+
+            self.log(f"결제 묶음: 상품 {n}개가 끝날 때마다 담긴 것만 결제")
+            added = await self.fire_all(products, batch=n, on_batch=on_batch)
+            result = {"result": "order-page" if any(b.get("result") == "order-page" for b in batches)
+                      else ("basket-only" if added else "nothing-added"),
+                      "added": [p.branduid for p in added], "batches": batches,
+                      "timings": self.timings(products)}
+            first = next((b for b in batches if b.get("result") == "order-page"), None)
+            if first:
+                result["orderUrl"], result["pay"] = first.get("orderUrl"), first.get("pay")
             if cleanup_after:
-                n = await self.remove_from_cart(page, products)
+                n_rm = await self.remove_from_cart(page, products)
                 left = await self.read_basket(page)
-                self.log(f"테스트 정리: {n}개 삭제, 남은 항목 {len(left)}개")
-                result["cleanup"] = {"removed": n, "left": len(left)}
+                self.log(f"테스트 정리: {n_rm}개 삭제, 남은 항목 {len(left)}개")
+                result["cleanup"] = {"removed": n_rm, "left": len(left)}
                 hold = False
-            elif reached and not (result.get("pay") or {}).get("window"):
-                # no KakaoPay popup: show the order page. With a popup, leave it on top.
-                try:
-                    await page.bring_to_front()
-                except Exception:
-                    pass
+            elif added:
+                opened = [b for b in batches if (b.get("pay") or {}).get("window")]
+                if not opened and order_pages:
+                    try:
+                        await order_pages[-1].bring_to_front()
+                    except Exception:
+                        pass
             return await self._finish(result, hold=hold)
 
     async def _finish(self, result: dict, hold: bool = False) -> dict:

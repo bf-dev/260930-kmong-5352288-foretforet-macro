@@ -22,7 +22,7 @@ def test_normalize_rows_coerces_qty_and_enabled():
         {"url": "u3", "option": "C", "qty": 500},
         "junk",
     ])
-    assert rows[0] == {"url": "u1", "option": "A", "qty": 3, "enabled": True}
+    assert rows[0] == {"url": "u1", "option": "A", "qty": 3, "enabled": True, "all_stock": False}
     assert rows[1]["qty"] == 0 and rows[1]["enabled"] is False
     assert rows[2]["qty"] == 99
     assert len(rows) == 3

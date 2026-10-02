@@ -115,13 +115,52 @@ def is_hidden_stub(body: bytes) -> bool:
         and b"optionlist" not in body
 
 
+def is_not_exist(body: bytes, status: int | None = None) -> bool:
+    """The shop says this product page does not exist (verified live 2026-10-02):
+
+    - a hidden / unlisted branduid answers HTTP 200 with a ~111 byte body
+      <script>alert('존재하지 않는 상품입니다.');parent.location.href='/';</script>
+      and the browser lands on the shop home ("포레포레 FORETFORET | 키즈 & 리빙 편집샵")
+    - an unknown path answers HTTP 404 with Makeshop's 764 byte error page
+      (<title>403 forbidden</title>, /images/403page.jpg, "페이지가 존재하지 않거나")
+    A real product page is 200+ KB, so every check is limited to small bodies."""
+    body = body or b""
+    if is_hidden_stub(body):
+        return True
+    if status == 404:
+        return True
+    if len(body) < 5000:
+        low = body.lower()
+        if b"403page.jpg" in low or b"403 forbidden" in low:
+            return True
+        if "페이지가 존재하지".encode() in body or "존재하지 않는 상품".encode() in body:
+            return True
+    return False
+
+
+def is_soldout_page(page: str) -> bool:
+    """Every option sold out: the button area shows soldout_area instead of the cart."""
+    btn = re.search(r'class="shopdetailButtonTop"(.*?)</div>', page, re.S)
+    area = btn.group(1) if btn else page
+    return "soldout_area" in area
+
+
 def is_open(page: str) -> bool:
     """On sale = cart button present and no 'sold out / stopped' caution."""
     btn = re.search(r'class="shopdetailButtonTop"(.*?)</div>', page, re.S)
     area = btn.group(1) if btn else page
-    if "product_caution" in area:
+    if "product_caution" in area or "soldout_area" in area:
         return False
     return "send_multi(" in area and 'class="cart"' in area
+
+
+def parse_max_amount(page: str) -> int | None:
+    """Site per-order quantity cap (var max_amount = '2';), None if unlimited/unknown."""
+    m = re.search(r"var\s+max_amount\s*=\s*'?(\d+)'?", page)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if n > 0 else None
 
 
 def normalize(s: str) -> str:

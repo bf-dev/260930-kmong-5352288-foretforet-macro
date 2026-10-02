@@ -2,7 +2,8 @@
 """Tkinter window for the foretforet purchase macro (Kmong customer 5352288, order 7643217).
 
 Every product row has: use checkbox, product URL, option (size) dropdown filled
-from the live page, quantity, and a delete button. An unchecked row or quantity
+from the live page, the 1.0.5 "재고 있는 옵션 전부 담기" checkbox (cart every
+in-stock option instead of the typed one), quantity, and a delete button. An unchecked row or quantity
 0 is skipped at the drop but keeps its URL and option. Everything except the
 password is saved between runs.
 """
@@ -10,7 +11,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, ttk
@@ -55,29 +55,33 @@ class Row:
         self.url = tk.StringVar(value=data.get("url", ""))
         self.option = tk.StringVar(value=data.get("option", ""))
         self.qty = tk.StringVar(value=str(data.get("qty", 1)))
+        # 1.0.5: checked = ignore the option field, cart every option in stock
+        self.all_stock = tk.BooleanVar(value=bool(data.get("all_stock", False)))
         self.info = tk.StringVar(value="")
         self.w_no = ttk.Label(f, text="", width=3, anchor="center")
         self.w_chk = ttk.Checkbutton(f, variable=self.enabled, command=self.refresh_style)
-        self.w_url = ttk.Entry(f, textvariable=self.url, width=52)
+        self.w_url = ttk.Entry(f, textvariable=self.url, width=44)
         self.w_opt = ttk.Combobox(f, textvariable=self.option, width=14)
         self.w_load = ttk.Button(f, text="옵션", width=5, command=self.load_options)
+        self.w_all = ttk.Checkbutton(f, variable=self.all_stock, command=self.refresh_style)
         self.w_qty = ttk.Spinbox(f, from_=0, to=99, textvariable=self.qty, width=4,
                                  command=self.refresh_style)
         self.w_info = ttk.Label(f, textvariable=self.info, width=24, foreground="#555")
         self.w_del = ttk.Button(f, text="삭제", width=5, command=lambda: app.delete_row(self))
-        for v in (self.enabled, self.url, self.option, self.qty):
+        for v in (self.enabled, self.url, self.option, self.qty, self.all_stock):
             v.trace_add("write", lambda *_: app.schedule_save())
         self.qty.trace_add("write", lambda *_: self.refresh_style())
         self.options: list[parser.Option] = []
 
     def widgets(self):
-        return (self.w_no, self.w_chk, self.w_url, self.w_opt, self.w_load, self.w_qty,
-                self.w_info, self.w_del)
+        return (self.w_no, self.w_chk, self.w_url, self.w_opt, self.w_load, self.w_all,
+                self.w_qty, self.w_info, self.w_del)
 
     def grid(self, r: int) -> None:
         self.w_no.configure(text=str(r))
         for c, w in enumerate(self.widgets()):
-            w.grid(row=r, column=c, padx=2, pady=2, sticky="we" if c == 2 else "w")
+            w.grid(row=r, column=c, padx=2, pady=2,
+                   sticky="we" if c == 2 else ("" if w is self.w_all else "w"))
         self.refresh_style()
 
     def destroy(self) -> None:
@@ -86,7 +90,8 @@ class Row:
 
     def data(self) -> dict:
         return config.normalize_rows([{"url": self.url.get(), "option": self.option.get(),
-                                       "qty": self.qty.get(), "enabled": self.enabled.get()}])[0]
+                                       "qty": self.qty.get(), "enabled": self.enabled.get(),
+                                       "all_stock": self.all_stock.get()}])[0]
 
     def active(self) -> bool:
         d = self.data()
@@ -94,6 +99,9 @@ class Row:
 
     def refresh_style(self) -> None:
         try:
+            # the option field is ignored while 전부 담기 is checked (kept, not cleared)
+            if self.app.engine is None:
+                self.w_opt.state(["disabled"] if self.all_stock.get() else ["!disabled"])
             skip = not self.active()
             self.w_no.configure(foreground="#aaa" if skip else "#000",
                                 text=self.w_no.cget("text"))
@@ -116,7 +124,8 @@ class Row:
                 title, opts, is_open = fetch_options(url)
                 self.app.ui(lambda: self._apply(title, opts, is_open))
             except Exception as exc:
-                self.app.ui(lambda: self.info.set(f"불러오기 실패: {type(exc).__name__}"))
+                name = type(exc).__name__
+                self.app.ui(lambda: self.info.set(f"불러오기 실패: {name}"))
         threading.Thread(target=work, daemon=True).start()
 
     def _apply(self, title: str, opts: list[parser.Option], is_open: bool) -> None:
@@ -127,7 +136,10 @@ class Row:
         if opt and opt.text != cur:
             self.option.set(opt.text)
         state = "판매중" if is_open else "오픈 전"
-        if opt:
+        if self.all_stock.get():
+            n = sum(1 for o in opts if o.buyable)
+            txt = f"전부 담기: 재고 {n}/{len(opts)}개 · {state}"
+        elif opt:
             stock = "무제한" if opt.unlimited else (opt.stock if opt.stock is not None else "?")
             txt = f"재고 {stock} · {state}"
         else:
@@ -152,7 +164,7 @@ class App:
         self.s = config.default_settings() if demo else config.load_settings()
 
         root.title(f"{config.APP_TITLE} v{config.APP_VERSION}")
-        root.geometry("1060x800")
+        root.geometry("1120x820")
         root.minsize(940, 640)
         style = ttk.Style()
         try:
@@ -195,8 +207,10 @@ class App:
         self.rows_canvas.bind("<Enter>", lambda e: self.rows_canvas.bind_all("<MouseWheel>", self._rows_wheel))
         self.rows_canvas.bind("<Leave>", lambda e: self.rows_canvas.unbind_all("<MouseWheel>"))
         self.rows_frame.columnconfigure(2, weight=1)
-        for c, t in enumerate(("번호", "사용", "상품 주소 (URL)", "옵션(사이즈)", "", "수량", "재고/상태", "")):
-            ttk.Label(self.rows_frame, text=t, style="Head.TLabel").grid(row=0, column=c, padx=2, sticky="w")
+        for c, t in enumerate(("번호", "사용", "상품 주소 (URL)", "옵션(사이즈)", "",
+                               "재고 있는 옵션\n전부 담기", "수량", "재고/상태", "")):
+            ttk.Label(self.rows_frame, text=t, style="Head.TLabel",
+                      justify="center").grid(row=0, column=c, padx=2, sticky="w")
         btns = ttk.Frame(box)
         btns.pack(fill="x", pady=(4, 0))
         self.btn_add = ttk.Button(btns, text="+ 상품 추가", command=self.add_row)
@@ -266,6 +280,14 @@ class App:
         self.auto_pay_click.trace_add("write", lambda *_: self.schedule_save())
         ttk.Checkbutton(pb, text="동의 자동 체크 후 [결제하기] 자동 클릭 (휴대폰 승인 창까지)",
                         variable=self.auto_pay_click).pack(side="left")
+        # 1.0.5: check out what is in the cart after every N finished product rows
+        self.checkout_batch = tk.StringVar(value=str(config.checkout_batch(self.s)))
+        self.checkout_batch.trace_add("write", lambda *_: self.schedule_save())
+        ttk.Label(pb, text="개 상품마다 결제", foreground="#000").pack(side="right")
+        self.w_batch = ttk.Spinbox(pb, from_=1, to=config.CHECKOUT_BATCH_MAX,
+                                   textvariable=self.checkout_batch, width=3)
+        self.w_batch.pack(side="right", padx=4)
+        ttk.Label(pb, text="결제 묶음").pack(side="right")
 
         # 5. controls + log
         cb = ttk.Frame(outer)
@@ -400,6 +422,7 @@ class App:
             "pay_method": PAY_METHODS.get(self.pay_method.get(), "KAKAOPAY"),
             "auto_pay_click": bool(self.auto_pay_click.get()),
             "remember_id": bool(self.remember_id.get()),
+            "checkout_batch": config.checkout_batch({"checkout_batch": self.checkout_batch.get()}),
         }
 
     def schedule_save(self) -> None:
@@ -423,7 +446,7 @@ class App:
         # 5352288 set 13:02 and one row after 시작, the run kept 10-01 10:00 and
         # the 6 default rows). Lock every input the run depends on.
         flag = ["disabled"] if busy else ["!disabled"]
-        widgets = [self.w_open_at, self.btn_add, self.btn_load_all]
+        widgets = [self.w_open_at, self.btn_add, self.btn_load_all, self.w_batch]
         for r in self.rows:
             widgets += [w for w in r.widgets() if w is not r.w_no]
         for w in widgets:
@@ -431,6 +454,9 @@ class App:
                 w.state(flag)
             except Exception:
                 pass
+        if not busy:
+            for r in self.rows:
+                r.refresh_style()
         self.btn_start.configure(state="disabled" if busy else "normal")
         self.btn_login.configure(state="disabled" if busy else "normal")
         self.btn_stop.configure(state="normal" if busy else "disabled")
@@ -548,7 +574,10 @@ def run_demo(hold_ms: int, diag: Diagnostics, rows: int = 0) -> None:
         app.log(f"데모: {len(app.rows)}줄 (상품 목록은 스크롤, 시작 버튼과 로그는 항상 보임)")
     app.rows[1].enabled.set(False)
     app.rows[4].qty.set("0")
-    app.log("데모: 2번 줄 체크 해제, 5번 줄 수량 0 (둘 다 건너뜀, 주소/옵션은 보관)")
+    app.rows[0].all_stock.set(True)
+    app.rows[0].refresh_style()
+    app.log("데모: 1번 줄 '재고 있는 옵션 전부 담기' 체크, 2번 줄 체크 해제, 5번 줄 수량 0 "
+            "(건너뛴 줄도 주소/옵션은 보관)")
     root.after(800, app.load_all)
     root.after(hold_ms, root.destroy)
     root.mainloop()
