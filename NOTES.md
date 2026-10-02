@@ -143,3 +143,31 @@ Evidence: 1.0.2 run ZIP of the 10:00 drop. Cart had 6 items, then 전체상품�
   68131ea6d654373fad25d1fac0f3bb8a709614cd4191522dc46e5b468f0c431a, published to
   https://static.neoworks.us/5352288/foretforet-macro-1.0.3.zip, manifest updated with FORCE=1.
   Artifacts: CI selftest row and engineer verification row arrived (matched=true).
+
+## 2026-10-02 drop-time fixes for 10-20 rows (1.0.4)
+Context: customer registers 10-20 rows at 17:00 KST, many stay sold out. 1.0.3 waited for every product
+until the deadline and read `basket_responses[-1]`, so with many tabs one product could take another's reply.
+- Fix 1, sold-out grace drop: `engine.fire_all` sets `drop_at = fire + config.SOLDOUT_GRACE_SECONDS` (30).
+  `_wait_open` returns `_drop(prod)` once past drop_at while the page is still hidden (raw-GET stub) or
+  shows `product_caution`. `prod.dropped=True`, message "품절 상태로 건너뜀", log line
+  `품절 상태로 건너뜀: <title> [bu] ...`. Time spent under a NetFunnel popup pushes drop_at back by the
+  grace. Pre-fire polling and arming are unchanged (drop_at only exists inside fire_all).
+- Fix 2, per-tab attribution: `_attach` on_response stores `"page": page` in each basket record;
+  `_add_to_cart` only accepts records after its own `before` index whose page is its own tab.
+- Fix 3, close resolved tabs: `_fire_product` wraps `_fire_product_once` in `finally: _close_product_tab`
+  (snapshot `product_<bu>` into the run ZIP, then close). fire_all calls it again for every product
+  (idempotent, `prod.page` set to None). Never touches the main/order tab, the KakaoPay popup or ctx.
+- Fix 4, GUI: rows live in a Canvas + Scrollbar (`rows_canvas`, `rows_frame`, `ROWS_MAX_H=300`, wheel
+  scrolls only when overflowing). `--guidemo --rows=N` pads to N rows; CI step "GUI screenshot (20 rows)"
+  writes `screenshots/gui20.png`.
+- Tests: `tests/test_drop_flow.py`, fully offline (Playwright route serves `c_10279533` / `p_10254531`
+  fixtures with a stub send_multi, basket.action answered locally with crossing delays, everything else
+  aborted, `_fetch_product` monkeypatched). Headless page load of the fixture takes ~1 s on the build box,
+  so timing assertions use grace >= 1.5 s (6 s in the tab-close test).
+- CI run 36948337875 (commit 9618b14). Zip 54,376,870 bytes, sha256
+  676539baf5654ebc392b5b97c432c139c1b7a65113cc235b03bab60d4ee8b0b2, published to
+  https://static.neoworks.us/5352288/foretforet-macro-1.0.4.zip, manifest at 1.0.4 (FORCE=1).
+  Verified with the 1.0.3 updater code (git archive f2a78d5): choose_download picks the 1.0.4 zip,
+  `_download` passes MIN_ZIP_BYTES, sha matches. Artifacts: CI selftest v1.0.4 row and engineer
+  verification row (matched=true), devnote posted.
+- Note: urllib default UA gets 403 from static.neoworks.us (Cloudflare); `requests` and curl are fine.
