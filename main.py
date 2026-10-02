@@ -100,11 +100,13 @@ def main(argv: list[str]) -> int:
             return selftest(diag)
         if "--guidemo" in argv:
             from foretforet.gui import run_demo
-            hold = 150000
+            hold, rows = 150000, 0
             for a in argv:
                 if a.startswith("--hold="):
                     hold = int(a.split("=", 1)[1])
-            run_demo(hold, diag)
+                if a.startswith("--rows="):
+                    rows = int(a.split("=", 1)[1])
+            run_demo(hold, diag, rows)
             return 0
         from foretforet.gui import run_gui
         run_gui(diag)

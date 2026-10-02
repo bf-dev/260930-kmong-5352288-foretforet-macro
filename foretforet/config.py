@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 APP_SLUG = "foretforet-macro"
 APP_TITLE = "포레포레 오픈 구매 매크로"
 CUSTOMER_ID = "5352288"
@@ -39,6 +39,8 @@ OPEN_POLL_MS = 500             # pause between reloads while the product is stil
 OPEN_WAIT_MAX_SECONDS = 900    # stop polling for "open" after this long past the open time (15 min)
 HIDDEN_POLL_MS = 400           # re-check interval while the product page is the "존재하지 않는 상품" alert stub
 PRE_FIRE_RELOAD_MS = 150       # reload this many ms after open time on the server clock
+# 1.0.4: after the open, a product still hidden / sold-out-caution this long is skipped
+SOLDOUT_GRACE_SECONDS = 30
 
 
 def is_frozen() -> bool:

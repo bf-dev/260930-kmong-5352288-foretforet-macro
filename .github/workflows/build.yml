@@ -95,6 +95,11 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File ci\gui_screenshot.ps1 -DemoArgs "--guidemo,--hold=150000" -Out gui.png -SettleSeconds 45
 
+      # 1.0.4: 20 rows. The rows table scrolls, [시작] and the log stay visible.
+      - name: GUI screenshot (20 rows)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File ci\gui_screenshot.ps1 -DemoArgs "--guidemo,--hold=150000,--rows=20" -Out gui20.png -SettleSeconds 45
+
       - name: sha256 of the delivered zip
         shell: pwsh
         run: |

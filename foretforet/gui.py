@@ -178,8 +178,22 @@ class App:
         box = ttk.LabelFrame(outer, text=" 1. 구매할 상품 (체크 해제 또는 수량 0 = 건너뜀, 주소/옵션은 그대로 보관) ",
                              padding=6)
         box.pack(fill="x", pady=(8, 4))
-        self.rows_frame = ttk.Frame(box)
-        self.rows_frame.pack(fill="x")
+        # 1.0.4: rows live in a scrollable canvas capped at ROWS_MAX_H, so 20+ rows
+        # never push [시작] and the log off the window.
+        holder = ttk.Frame(box)
+        holder.pack(fill="x")
+        self.rows_canvas = tk.Canvas(holder, highlightthickness=0, borderwidth=0, height=60)
+        self.rows_scroll = ttk.Scrollbar(holder, orient="vertical", command=self.rows_canvas.yview)
+        self.rows_canvas.configure(yscrollcommand=self.rows_scroll.set)
+        self.rows_scroll.pack(side="right", fill="y")
+        self.rows_canvas.pack(side="left", fill="x", expand=True)
+        self.rows_frame = ttk.Frame(self.rows_canvas)
+        self._rows_win = self.rows_canvas.create_window(0, 0, window=self.rows_frame, anchor="nw")
+        self.rows_frame.bind("<Configure>", lambda e: self._fit_rows())
+        self.rows_canvas.bind("<Configure>",
+                              lambda e: self.rows_canvas.itemconfigure(self._rows_win, width=e.width))
+        self.rows_canvas.bind("<Enter>", lambda e: self.rows_canvas.bind_all("<MouseWheel>", self._rows_wheel))
+        self.rows_canvas.bind("<Leave>", lambda e: self.rows_canvas.unbind_all("<MouseWheel>"))
         self.rows_frame.columnconfigure(2, weight=1)
         for c, t in enumerate(("번호", "사용", "상품 주소 (URL)", "옵션(사이즈)", "", "수량", "재고/상태", "")):
             ttk.Label(self.rows_frame, text=t, style="Head.TLabel").grid(row=0, column=c, padx=2, sticky="w")
@@ -329,11 +343,30 @@ class App:
         self.root.after(500, self._tick)
 
     # ------------------------------------------------------------------ rows
+    ROWS_MAX_H = 300
+
+    def _fit_rows(self) -> None:
+        try:
+            need = self.rows_frame.winfo_reqheight()
+            self.rows_canvas.configure(scrollregion=self.rows_canvas.bbox("all"),
+                                       height=min(need, self.ROWS_MAX_H))
+        except Exception:
+            pass
+
+    def _rows_wheel(self, e) -> None:
+        try:
+            if self.rows_frame.winfo_reqheight() > self.rows_canvas.winfo_height():
+                self.rows_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units")
+        except Exception:
+            pass
+
     def add_row(self, data: dict | None = None, save: bool = True) -> None:
         row = Row(self, data or {"url": "", "option": "", "qty": 1, "enabled": True})
         self.rows.append(row)
         row.grid(len(self.rows))
         self.update_active()
+        if save:   # user pressed [+ 상품 추가]: show the new row
+            self.root.after(50, lambda: self.rows_canvas.yview_moveto(1.0))
         if save:
             self.schedule_save()
 
@@ -502,10 +535,17 @@ def run_gui(diag: Diagnostics) -> None:
     root.mainloop()
 
 
-def run_demo(hold_ms: int, diag: Diagnostics) -> None:
-    """CI screenshot: default rows, row 2 unchecked, row 5 quantity 0, real option lookup."""
+def run_demo(hold_ms: int, diag: Diagnostics, rows: int = 0) -> None:
+    """CI screenshot: default rows, row 2 unchecked, row 5 quantity 0, real option lookup.
+    rows=N pads the table to N rows (cycling the defaults) to prove the scroll layout."""
     root = tk.Tk()
     app = App(root, diag, demo=True)
+    i = 0
+    while len(app.rows) < rows:
+        app.add_row(dict(config.DEFAULT_ROWS[i % len(config.DEFAULT_ROWS)]), save=False)
+        i += 1
+    if rows:
+        app.log(f"데모: {len(app.rows)}줄 (상품 목록은 스크롤, 시작 버튼과 로그는 항상 보임)")
     app.rows[1].enabled.set(False)
     app.rows[4].qty.set("0")
     app.log("데모: 2번 줄 체크 해제, 5번 줄 수량 0 (둘 다 건너뜀, 주소/옵션은 보관)")
