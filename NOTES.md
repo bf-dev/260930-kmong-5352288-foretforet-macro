@@ -217,3 +217,36 @@ In-stock test products used on 2026-10-02: 10254531 (RLL sizes, member-only), 10
 
 1.0.5 release: commit 610c3b7, CI run 36993873871 (tests, PE, Defender, selftest, gui.png all green),
 zip sha256 14cde837c25478742c22062e39ca49090e488504553794cf691d803ca51a5205, manifest bumped 2026-10-02.
+
+## 2026-10-06 stock shortfall -> retry once with qty 1 (1.0.6)
+
+Customer request (2026-10-06): "남은 수량 말고 그냥 한 개로 해서 담아 주세요 ... 1개 담고 품절일경우 패스".
+So the macro NEVER computes remaining stock any more. `cap_qty` only applies the site per-option
+max (`max_amount`), never the stock number.
+
+Behaviour, per option (checkbox rows apply it to every option they cart):
+- qty > 1 and the cart attempt fails for a stock shortfall -> ONE retry at qty 1, then stop.
+  Success status: "재고 부족, 1개 담음". qty 1 also fails, or the answer is sold out: "품절, 건너뜀"
+  (dropped). Any other failure keeps the raw shop message. No loops.
+- Two shortfall signals, both verified:
+  1. Client clamp: shop JS `set_amount(inp,'basic')` alerts
+     "선택하신 상품의 옵션은 수량이 부족합니다.\n수량을 조절해주세요." and resets the input to 1.
+     `_pick_send` reports `clamped`; result "client-1", the row is carted x1 in the same send.
+  2. Server reply from basket.action: "[name]상품의 재고가 현재 N개 입니다." (`stock_short(msg)`:
+     has 재고/부족/수량 and no 품절). Engine reloads the page once (`_load`), re-picks at qty 1,
+     one `send_multi`. Result "ok-1" or "soldout". Sold out text: "선택된 상품/옵션은 품절입니다."
+- Checkout (go_order): a basket stock alert lowers the item to 1 (was: to the remaining count).
+- `timings()` entries carry `fallback: [{options, requested, result}]`; gui.py puts them in
+  meta.json `fallback` and reporter.summary_text includes it in the upload text.
+- Tests: tests/test_drop_flow.py has 5 new cases (retry once ok, retry fails -> soldout, qty 1
+  never retries, checkbox row retries every option, client clamp reported). 53 pass locally (.venv).
+
+Live evidence 2026-10-06 06:27 KST (guest, no payment, ~/workspace/kmong/tmp/ff106/live_run.py,
+disposable): 10254531 "RLL,9_12M" qty 2 with live stock 1 -> shop alert above ->
+"재고 부족, 1개 담음: RLL,9_12M (사이트가 1개로 줄임)", basket 1개 MATCH; 10275092 "20D,10Y" carted
+normally; guest order refused as 회원전용 (expected); both test items removed, basket 0 rows.
+Option 3_4Y on 10254531 no longer exists. Port 18765 may already be held by an older
+`ssh -D` tunnel; check `ss -ltnp | grep 18765` and kill the stale one after testing.
+
+1.0.6 release: commit 1994918, CI run 37413929098 (tests, selftest, gui.png green),
+zip sha256 e66568e9dc14e04be92401e99248cc986550afd7faa1966bbc47852586ab5ace, manifest bumped 2026-10-06.

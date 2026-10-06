@@ -16,11 +16,11 @@
     "artifactSource": "foretforet-macro-run",
     "publish": "~/workspace/scripts/works-publish 5352288 out/foretforet-macro-<ver>.zip",
     "manifest": "https://static.neoworks.us/5352288/version-foretforet.json",
-    "version": "1.0.5",
-    "package": "https://static.neoworks.us/5352288/foretforet-macro-1.0.5.zip",
-    "sha256": "14cde837c25478742c22062e39ca49090e488504553794cf691d803ca51a5205",
-    "ciRun": 36993873871,
-    "publishedAt": "2026-10-02"
+    "version": "1.0.6",
+    "package": "https://static.neoworks.us/5352288/foretforet-macro-1.0.6.zip",
+    "sha256": "e66568e9dc14e04be92401e99248cc986550afd7faa1966bbc47852586ab5ace",
+    "ciRun": 37413929098,
+    "publishedAt": "2026-10-06"
   },
   "notes": "foretforet.com (MakeShop) open-drop purchase macro. Adds rows (url/size/qty, enable checkbox) to cart at the exact second, goes to order.html, selects KakaoPay + all consents and clicks 결제하기 so the customer approves on the phone. See NOTES.md."
 }
