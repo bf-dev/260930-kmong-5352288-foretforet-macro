@@ -519,6 +519,11 @@ class App:
                     "loginType": (eng.s.get("login_type") if eng else self.login_type.get()),
                     "rows": (eng.s.get("rows") if eng else [r.data() for r in self.rows]),
                     "serverOffsetMs": round(eng.clock.offset_ms if eng else 0)}
+            # 1.0.6: per-row qty -> 1 fallback outcome, readable in the upload text
+            fb = [f"{t['branduid']} {t.get('message', '')} {t['fallback']}"
+                  for t in (res.get("timings") or []) if t.get("fallback")]
+            if fb:
+                meta["fallback"] = "; ".join(fb)
             self.run_diag.add_json("result.json", res)
             self.run_diag.upload(f"{meta['mode']}: {result}", meta)
         except Exception:

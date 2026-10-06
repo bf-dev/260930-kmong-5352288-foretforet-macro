@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""1.0.5 drop-time tests (Kmong customer 5352288), fully offline.
+"""1.0.5/1.0.6 drop-time tests (Kmong customer 5352288), fully offline.
 
 Every request from the test browser goes through one Playwright route: product
 pages are served from tests/fixtures (c_* = not-yet-open caution, p_*/f_* = on
@@ -12,6 +12,8 @@ Covers:
 - open all, check once, cart once: a missing size or a sold-out option finishes the
   row at once, a sold-out page is final, nothing is ever posted twice
 - checkbox "재고 있는 옵션 전부 담기": every buyable option, row qty cut to the site cap
+- 1.0.6 stock shortfall: a qty > 1 row that the shop refuses is retried once with
+  qty 1; qty 1 failing, or a sold-out answer, skips the row; no other retries
 - page does not exist: final "상품 없음" with the checkbox, retried until it opens without
 - NetFunnel queue: waited out, never reloaded
 - checkout every 3 finished rows (on_batch), the last group may be smaller
@@ -91,7 +93,8 @@ def _row(bu, opt, qty=1, all_stock=False):
 
 def _run(rows, pages, basket, hidden=None, batch=None, slow=None):
     """pages: branduid -> fixture bytes, or "404" for the Makeshop 404 page.
-    basket: branduid -> (delay_s, status, message).
+    basket: branduid -> (delay_s, status, message), or a callable
+            (picks, n_posts_for_this_branduid) -> that tuple.
     hidden: branduid -> seconds after start until the "does not exist" stub turns
             into the real page (None = forever).
     Returns a dict with engine, products, logs, posts, page loads, closed times,
@@ -125,8 +128,12 @@ def _run(rows, pages, basket, hidden=None, batch=None, slow=None):
                 if "basket.action" in url:
                     q = parse_qs(req.post_data or "")
                     bu = q.get("branduid", [""])[0]
-                    out["posts"].append({"branduid": bu, "picks": q.get("picks", [""])[0], "at": time.time()})
-                    delay, ok, msg = basket[bu]
+                    picks = q.get("picks", [""])[0]
+                    out["posts"].append({"branduid": bu, "picks": picks, "at": time.time()})
+                    v = basket[bu]
+                    if callable(v):
+                        v = v(picks, sum(1 for x in out["posts"] if x["branduid"] == bu))
+                    delay, ok, msg = v
                     await asyncio.sleep(delay)
                     body = {"status": ok, "message": msg,
                             "etc_data": {"basket_uid_array": [f"uid-{bu}"] if ok else []}}
@@ -225,11 +232,12 @@ def test_tracker_stubs_cover_the_shop_calls():
     assert asyncio.run(go()) == ["function", "false"]
 
 
-def test_cap_qty_site_cap_and_stock():
+def test_cap_qty_site_cap_only_never_stock():
     o = parser.Option("0", "RLL,9_12M", 4, "SALE")
     assert cap_qty(5, 3, o) == 3          # site per-option cap
     assert cap_qty(2, 3, o) == 2
-    assert cap_qty(9, None, o) == 4       # known stock
+    assert cap_qty(9, None, o) == 9       # 1.0.6: stock is never weighed up front
+    assert cap_qty(2, None, parser.Option("0", "RLL,3_4Y", 1, "SALE")) == 2
     assert cap_qty(9, None, parser.Option("1", "X", None, "SALE", unlimited=True)) == 9
 
 
@@ -291,13 +299,13 @@ def test_checkbox_row_carts_every_buyable_option_capped(fast):
     r = _run(rows, pages, {"1001": (0.05, True, ""), "1002": (0.05, True, "")})
     p = r["prods"]
     assert p["1001"].added and p["1002"].added
-    # 18_24M SOLDOUT left out; qty 5 cut to the site cap 3, 3_4Y to its stock 2
+    # 18_24M SOLDOUT left out; qty 5 cut to the site cap 3 (1.0.6: not to the stock)
     assert p["1001"].picked == [("RLL,9_12M", 3), ("RLL,12_18M", 3), ("RLL,2_3Y", 3),
-                                ("RLL,3_4Y", 2), ("RLL,4_5Y", 3)]
+                                ("RLL,3_4Y", 3), ("RLL,4_5Y", 3)]
     # manual row unchanged: the typed option with the typed qty
     assert p["1002"].picked == [("RLL,2_3Y", 2)]
     by = {x["branduid"]: x["picks"] for x in r["posts"]}
-    assert by["1001"] == "RLL,9_12Mx3;RLL,12_18Mx3;RLL,2_3Yx3;RLL,3_4Yx2;RLL,4_5Yx3"
+    assert by["1001"] == "RLL,9_12Mx3;RLL,12_18Mx3;RLL,2_3Yx3;RLL,3_4Yx3;RLL,4_5Yx3"
     assert len(r["posts"]) == 2
     assert any("재고 있는 옵션 전부 담기: 구매 가능 5/6개" in m for m in r["logs"])
 
@@ -420,3 +428,92 @@ def test_tabs_close_as_each_product_resolves(fast, monkeypatch):
     assert set(c) == {"1001", "10279533", "1002"}
     assert all(p.page is None for p in r["prods"].values())
     assert r["main_open"] and r["n_pages"] == 1
+
+
+# ------------------------------------------------------------------ 1.0.6 qty -> 1
+SHORT = "[RLL 후드]상품의 재고가 현재 1개 입니다."
+SOLD = "선택된 상품/옵션은 품절입니다."
+
+
+def _short_then(second):
+    """First post: stock shortfall. Second post: (ok, msg) given its picks."""
+    def answer(picks, n):
+        if n == 1:
+            return 0.05, False, SHORT
+        return (0.05,) + second(picks)
+    return answer
+
+
+def test_short_stock_retries_once_with_qty_1(fast):
+    rows = [_row("1001", "RLL,2_3Y", 2), _row("1002", "RLL,9_12M", 2)]
+    basket = {"1001": _short_then(lambda picks: (picks.endswith("x1"), "" if picks.endswith("x1") else SHORT)),
+              "1002": (0.05, True, "")}
+    r = _run(rows, {"1001": OPEN, "1002": OPEN}, basket)
+    p = r["prods"]["1001"]
+    posts = [x["picks"] for x in r["posts"] if x["branduid"] == "1001"]
+    assert posts == ["RLL,2_3Yx2", "RLL,2_3Yx1"]
+    assert p.added and p.cart_ids == ["uid-1001"]
+    assert p.picked == [("RLL,2_3Y", 1)]
+    assert p.message == "재고 부족, 1개 담음"
+    assert p.fallback == [{"options": ["RLL,2_3Y"], "requested": [2], "result": "ok-1"}]
+    assert r["loads"]["1001"] == 2                   # one reload for the one retry
+    assert any("재고 부족 -> 1개로 다시 담기: 성공" in m for m in r["logs"]), r["logs"]
+    # the other row is untouched by the fallback
+    q = r["prods"]["1002"]
+    assert q.added and q.picked == [("RLL,9_12M", 2)] and q.fallback == [] and q.message == ""
+    t = {x["branduid"]: x for x in r["eng"].timings(list(r["prods"].values()))}
+    assert t["1001"]["fallback"][0]["result"] == "ok-1"
+
+
+def test_short_stock_then_qty_1_fails_is_soldout_no_more_tries(fast):
+    rows = [_row("1001", "RLL,2_3Y", 3)]
+    r = _run(rows, {"1001": OPEN}, {"1001": _short_then(lambda picks: (False, SOLD))})
+    p = r["prods"]["1001"]
+    assert [x["picks"] for x in r["posts"]] == ["RLL,2_3Yx3", "RLL,2_3Yx1"]
+    assert not p.added and p.dropped and "품절" in p.message
+    assert p.message == "품절, 건너뜀"
+    assert p.fallback[0]["result"] == "soldout"
+    assert r["loads"]["1001"] == 2
+    assert any("1개도 실패, 품절, 건너뜀" in m for m in r["logs"]), r["logs"]
+
+
+def test_qty_1_short_or_soldout_answer_never_retries(fast):
+    rows = [_row("1001", "RLL,2_3Y", 1), _row("1002", "RLL,9_12M", 2)]
+    basket = {"1001": (0.05, False, SHORT), "1002": (0.05, False, SOLD)}
+    r = _run(rows, {"1001": OPEN, "1002": OPEN}, basket)
+    by = {}
+    for x in r["posts"]:
+        by.setdefault(x["branduid"], []).append(x["picks"])
+    assert by == {"1001": ["RLL,2_3Yx1"], "1002": ["RLL,9_12Mx2"]}
+    for bu in ("1001", "1002"):
+        p = r["prods"][bu]
+        assert not p.added and p.message == "품절, 건너뜀" and p.fallback == []
+        assert r["loads"][bu] == 1
+
+
+def test_checkbox_row_short_stock_retries_every_option_at_1(fast):
+    rows = [_row("1001", "", 2, all_stock=True)]
+    basket = {"1001": _short_then(lambda picks: (True, ""))}
+    r = _run(rows, {"1001": OPEN}, basket)
+    p = r["prods"]["1001"]
+    posts = [x["picks"] for x in r["posts"]]
+    assert len(posts) == 2
+    assert posts[1] == "RLL,9_12Mx1;RLL,12_18Mx1;RLL,2_3Yx1;RLL,3_4Yx1;RLL,4_5Yx1"
+    assert p.added and p.message == "재고 부족, 1개 담음"
+    assert p.fallback[0]["result"] == "ok-1" and len(p.fallback[0]["options"]) == 5
+
+
+def test_shop_clamp_to_1_on_page_is_reported(fast, monkeypatch):
+    """The real multi_option.js set_amount alerts and resets the amount to 1 when
+    the option has less stock than asked. Carted at 1, reported as the fallback."""
+    import sys
+    me = sys.modules[__name__]
+    clamp = ("window.set_amount = function (inp) { if (inp.getAttribute('data-opt') === 'RLL,3_4Y' "
+             "&& parseInt(inp.value, 10) > 2) { alert('선택하신 옵션의 재고가 부족합니다.'); inp.value = '1'; } };")
+    monkeypatch.setattr(me, "STUB", STUB.replace("window.set_amount = function () {};", clamp))
+    rows = [_row("1001", "RLL,3_4Y", 3)]
+    r = _run(rows, {"1001": OPEN}, {"1001": (0.05, True, "")})
+    p = r["prods"]["1001"]
+    assert [x["picks"] for x in r["posts"]] == ["RLL,3_4Yx1"]
+    assert p.added and p.picked == [("RLL,3_4Y", 1)] and p.message == "재고 부족, 1개 담음"
+    assert p.fallback == [{"options": ["RLL,3_4Y"], "requested": [3], "result": "client-1"}]

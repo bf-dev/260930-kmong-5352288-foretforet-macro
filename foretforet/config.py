@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 APP_SLUG = "foretforet-macro"
 APP_TITLE = "포레포레 오픈 구매 매크로"
 CUSTOMER_ID = "5352288"

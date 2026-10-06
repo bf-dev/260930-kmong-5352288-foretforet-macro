@@ -196,7 +196,7 @@ class Diagnostics:
             f"OS: {m['os']} / frozen={m['frozen']}",
             f"시작 {m['startedAt']} → 종료 {m['finishedAt']}",
         ]
-        for k in ("mode", "openAt", "rows", "serverOffsetMs", "result", "loginType"):
+        for k in ("mode", "openAt", "rows", "serverOffsetMs", "result", "loginType", "fallback"):
             if extra_meta and k in extra_meta:
                 lines.append(f"{k}: {extra_meta[k]}")
         with self._lock:

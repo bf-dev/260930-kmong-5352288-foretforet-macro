@@ -12,11 +12,13 @@ Flow for one run:
      popup is up or the server is slow never reload, just wait
   6. per product, exactly once on the open page: pick the wanted options (or, with
      "재고 있는 옵션 전부 담기", every option in stock), skip sold-out / missing
-     ones, set the quantities and send_multi() once. A sold-out page, a missing
+     ones, set the quantities and send_multi() once. 1.0.6: if the shop says not
+     that many are left and a quantity was above 1, one more try with qty 1, then
+     품절/skip. Stock is never computed. A sold-out page, a missing
      option or (checkbox rows) a page that does not exist is final, no retry
   7. every N finished products (결제 묶음, default 3): basket -> tick only that
      group's items -> order.html; a sold-out item is dropped and a short-stock item
-     is cut to what is left, then order again. A group with nothing carted is skipped
+     is cut to 1 (1.0.6), then order again. A group with nothing carted is skipped
   8. order.html: KakaoPay + every required consent in one pass, press 결제하기 so
      the KakaoPay QR / approval window opens
 
@@ -217,6 +219,7 @@ class Product:
     t_open: float = 0.0
     t_cart: float = 0.0
     picked: list = field(default_factory=list)   # [(option text, qty)] sent to the cart
+    fallback: list = field(default_factory=list) # 1.0.6: [{options, requested, result}] qty -> 1 retries
     deadline: float = 0.0
     drop_at: float = 0.0
 
@@ -249,14 +252,21 @@ async def _quiet(coro) -> None:
 
 
 def cap_qty(qty: int, cap: int | None, opt: parser.Option) -> int:
-    """Quantity for one option: the row quantity, cut to the site's per-option cap
-    and to the known stock."""
+    """Quantity for one option: the row quantity, cut to the site's per-option cap.
+    1.0.6: never cut to the stock (the customer: no time to weigh stock at the drop).
+    A stock shortfall is answered by one retry with qty 1 in _add_to_cart."""
     n = max(1, int(qty))
     if cap and cap > 0:
         n = min(n, cap)
-    if opt.stock is not None and not opt.unlimited and opt.stock > 0:
-        n = min(n, opt.stock)
     return max(1, n)
+
+
+def stock_short(msg: str) -> bool:
+    """The shop's answer means "not that many left" (not "sold out")."""
+    m = msg or ""
+    if "품절" in m:
+        return False
+    return any(k in m for k in ("재고", "부족", "수량"))
 
 
 class Engine:
@@ -748,7 +758,7 @@ class Engine:
         """(option, qty, label) to cart. Manual rows: the typed option as in 1.0.4, but a
         missing or sold-out option is skipped at once. Checkbox rows: every option the
         shop still sells, each with the row quantity. Quantities are cut to the
-        site's per-option cap and to the known stock."""
+        site's per-option cap only (1.0.6: stock is never weighed up front)."""
         want: dict[str, list] = {}
         order: list[str] = []
 
@@ -784,36 +794,32 @@ class Engine:
             o, q, label = want[v]
             n = cap_qty(q, cap, o)
             if n < q:
-                self.log(f"[{prod.branduid}] {o.text} 수량 {q} -> {n} (사이트 최대 {cap or '-'}, 재고 {o.stock})")
+                self.log(f"[{prod.branduid}] {o.text} 수량 {q} -> {n} (사이트 최대 {cap})")
             out.append((o, n, label))
         return out
 
-    async def _add_to_cart(self, prod: Product) -> None:
-        """Exactly one cart try on the open page: read the options once, pick them all
-        in one evaluate, send_multi() once, read this tab's own basket.action reply."""
+    async def _pick_send(self, prod: Product, plan: list) -> tuple:
+        """Pick the planned options in one evaluate, send_multi() once and wait for
+        this tab's own basket.action reply. Returns (picked, clamped, reply_or_None,
+        dialogs); picked is None when the shop refused every option. clamped lists
+        options the shop itself cut to 1 (set_amount stock check) on the page."""
         page = prod.page
-        html = await page.content()
-        opts = parser.parse_options(html)
-        try:
-            cap = int(await page.evaluate(_JS_MAX_AMOUNT)) or None
-        except Exception:
-            cap = parser.parse_max_amount(html)
-        plan = self._plan(prod, opts, cap)
-        if not plan:
-            prod.message = "담을 옵션 없음 (품절/옵션 없음)"
-            self.log(f"[{prod.branduid}] 담을 옵션 없음, 바로 다음으로")
-            return
+        mark = len(self._page_dialogs.get(id(page), []))
         res = await page.evaluate(_JS_PICK, [[o.value, n] for o, n, _ in plan])
-        picked = []
+        picked, clamped = [], []
         for (o, n, _), r in zip(plan, res or []):
             if r.get("ok"):
-                picked.append((o.text, int(r.get("qty") or n)))
+                got = int(r.get("qty") or n)
+                picked.append((o.text, got))
+                if n > 1 and got == 1:
+                    clamped.append(o.text)
             else:
                 self.log(f"[{prod.branduid}] {o.text} 선택 안 됨 (사이트가 거절){': ' + r['err'] if r.get('err') else ''}")
         if not picked:
-            prod.message = "담을 옵션 없음 (선택 거절)"
-            return
-        prod.picked = picked
+            return None, [], None, []
+        dialogs = self._page_dialogs.get(id(page), [])[mark:]
+        # a clamp to 1 after a "최대 N개" alert is the site cap, not stock
+        clamped = [] if any("최대" in d for d in dialogs) else clamped
         before = len(self.basket_responses)
 
         def mine() -> list[dict]:
@@ -828,26 +834,112 @@ class Engine:
                 t_end = time.time() + config.FIRE_GOTO_TIMEOUT_MS / 1000.0
             await asyncio.sleep(0.03)
         own = mine()
-        if not own:
-            prod.message = "장바구니 응답 없음"
-            self.log(f"[{prod.branduid}] 장바구니 응답이 없습니다")
-            return
+        dialogs = self._page_dialogs.get(id(page), [])[mark:]
+        return picked, clamped, (own[0] if own else None), dialogs
+
+    def _carted(self, prod: Product, picked: list, data: dict) -> None:
         prod.t_cart = time.time()
-        body = own[0]["body"]
+        prod.added = True
+        prod.picked = picked
+        arr = ((data.get("etc_data") or {}).get("basket_uid_array")) or []
+        prod.cart_ids = [str(x) for x in arr]
+
+    async def _add_to_cart(self, prod: Product) -> None:
+        """One cart try on the open page: read the options once, pick them all in one
+        evaluate, send_multi() once, read this tab's own basket.action reply.
+
+        1.0.6: if the shop answers "not that many left" and a quantity was above 1,
+        reload once and try again with every quantity at 1. Stock is never read or
+        computed. If qty 1 fails too, or the answer was sold out, the row is 품절
+        and skipped. No further retries."""
+        page, bu = prod.page, prod.branduid
+        html = await page.content()
+        opts = parser.parse_options(html)
+        try:
+            cap = int(await page.evaluate(_JS_MAX_AMOUNT)) or None
+        except Exception:
+            cap = parser.parse_max_amount(html)
+        plan = self._plan(prod, opts, cap)
+        if not plan:
+            prod.message = "담을 옵션 없음 (품절/옵션 없음)"
+            self.log(f"[{bu}] 담을 옵션 없음, 바로 다음으로")
+            return
+        picked, clamped, reply, dialogs = await self._pick_send(prod, plan)
+        if picked is None:
+            prod.message = "담을 옵션 없음 (선택 거절)"
+            return
+        prod.picked = picked
+        names = ", ".join(f"{t} x{q}" for t, q in picked)
+        if reply is None:
+            prod.message = "장바구니 응답 없음"
+            self.log(f"[{bu}] 장바구니 응답이 없습니다")
+            return
+        body = reply["body"]
         try:
             data = json.loads(body)
         except Exception:
             data = {}
-        names = ", ".join(f"{t} x{q}" for t, q in picked)
         if data.get("status") is True:
-            prod.added = True
-            arr = ((data.get("etc_data") or {}).get("basket_uid_array")) or []
-            prod.cart_ids = [str(x) for x in arr]
-            self.log(f"[{prod.branduid}] 장바구니 담기 성공: {names} "
+            self._carted(prod, picked, data)
+            if clamped:
+                # the shop's own stock check already cut these to 1 on the page
+                prod.message = "재고 부족, 1개 담음"
+                prod.fallback.append({"options": clamped,
+                                      "requested": [n for o, n, _ in plan if o.text in clamped],
+                                      "result": "client-1"})
+                self.log(f"[{bu}] 재고 부족, 1개 담음: {', '.join(clamped)} (사이트가 1개로 줄임)")
+            self.log(f"[{bu}] 장바구니 담기 성공: {names} "
                      f"(오픈→담기 {prod.t_cart - prod.t_open:.2f}초)")
-        else:
-            prod.message = str(data.get("message") or body[:200])
-            self.log(f"[{prod.branduid}] 장바구니 담기 실패: {prod.message}")
+            return
+        msg = str(data.get("message") or body[:200])
+        self.log(f"[{bu}] 장바구니 담기 실패: {msg}")
+        multi = [(o, n, lb) for o, n, lb in plan if n > 1]
+        short = stock_short(msg) or any(stock_short(d) for d in dialogs)
+        if not (short and multi) or self.stopped():
+            prod.message = "품절, 건너뜀" if ("품절" in msg or short) else msg
+            if prod.message != msg:
+                prod.dropped = True
+                self.log(f"[{bu}] 품절, 건너뜀")
+            return
+        # exactly one retry: same options, every quantity 1
+        entry = {"options": [o.text for o, _, _ in multi], "requested": [n for _, n, _ in multi],
+                 "result": "soldout"}
+        prod.fallback.append(entry)
+        self.log(f"[{bu}] 재고 부족 -> 1개로 다시 담기: {', '.join(entry['options'])}")
+        kind = await self._load(prod)
+        if kind != "open":
+            prod.dropped = True
+            prod.message = "품절, 건너뜀"
+            self.log(f"[{bu}] 다시 열어 보니 {kind}, 품절, 건너뜀")
+            return
+        opts = parser.parse_options(await page.content())
+        by_val = {o.value: o for o in opts}
+        plan1 = [(by_val[o.value], 1, lb) for o, _, lb in plan
+                 if o.value in by_val and by_val[o.value].buyable]
+        if not plan1:
+            prod.dropped = True
+            prod.message = "품절, 건너뜀"
+            self.log(f"[{bu}] 1개 담을 옵션도 품절, 건너뜀")
+            return
+        picked1, _, reply1, _ = await self._pick_send(prod, plan1)
+        data1: dict = {}
+        if reply1 is not None:
+            try:
+                data1 = json.loads(reply1["body"])
+            except Exception:
+                data1 = {}
+        if picked1 and data1.get("status") is True:
+            self._carted(prod, picked1, data1)
+            prod.message = "재고 부족, 1개 담음"
+            entry["result"] = "ok-1"
+            self.log(f"[{bu}] 재고 부족 -> 1개로 다시 담기: 성공 "
+                     f"({', '.join(f'{t} x{q}' for t, q in picked1)}, 오픈→담기 {prod.t_cart - prod.t_open:.2f}초)")
+            return
+        prod.dropped = True
+        prod.message = "품절, 건너뜀"
+        why = (str(data1.get("message") or (reply1 or {}).get("body", "")[:120]) if reply1 is not None
+               else "응답 없음")
+        self.log(f"[{bu}] 1개도 실패, 품절, 건너뜀 ({why})")
 
     async def _fire_product(self, prod: Product) -> None:
         try:
@@ -929,7 +1021,7 @@ class Engine:
 
     async def go_order(self, page, products: list[Product]) -> str:
         """Basket -> order.html. Sold-out rows are dropped from the selection and
-        rows with less stock than ordered are cut down to what is left, then the
+        rows with less stock than ordered are cut down to 1 (1.0.6), then the
         order is retried, so one sold-out item never blocks the rest."""
         items = await self.read_basket(page)
         self.log(f"장바구니 {len(items)}개 항목")
@@ -985,10 +1077,11 @@ class Engine:
             by_name = {it["name"]: it for it in self._ours(items, products)}
             for name, kind, left in found:
                 it = by_name.get(name)
-                if kind == "stock" and left > 0 and it and it["amount"] > left:
-                    self.log(f"재고 {left}개만 남음: {name[-30:]} 수량 {it['amount']} -> {left}")
+                if kind == "stock" and left > 0 and it and it["amount"] > 1:
+                    # 1.0.6: not the remaining stock, just 1 (customer, 2026-10-06)
+                    self.log(f"재고 부족, 1개로 변경: {name[-30:]} 수량 {it['amount']} -> 1")
                     try:
-                        await page.evaluate(_JS_SET_AMOUNT, [it["i"], left])
+                        await page.evaluate(_JS_SET_AMOUNT, [it["i"], 1])
                         await asyncio.sleep(1.2)
                     except Exception as exc:
                         self.log(f"수량 변경 실패: {type(exc).__name__}, 이 상품은 제외")
@@ -1211,6 +1304,7 @@ class Engine:
     def timings(self, products: list[Product]) -> list[dict]:
         return [{"branduid": p.branduid, "added": p.added, "message": p.message,
                  "picked": [f"{t} x{q}" for t, q in p.picked],
+                 "fallback": p.fallback,
                  "fire_to_open": round(p.t_open - p.t_fire, 3) if p.t_open else None,
                  "open_to_cart": round(p.t_cart - p.t_open, 3) if p.t_cart and p.t_open else None}
                 for p in products]
